@@ -21,6 +21,7 @@ import os
 import random
 import tempfile
 from typing import List, Literal, Optional, Union
+import torch
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -250,12 +251,19 @@ class ServerArgs:
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
     weight_loader_disable_mmap: bool = False
+    
+    # KV cache comfression
+    kv_cache_compression: Optional[str] = None
+    ext_cache_dim: Optional[int] = 0
+    ext_cache_dtype: Optional[torch.dtype] = torch.float32
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
     sm_group_num: int = 3
 
     def __post_init__(self):
+        if self.kv_cache_compression is not None:
+            self.ext_cache_dim = self.ext_cache_dim or 1
         # Expert parallelism
         if self.enable_ep_moe:
             self.ep_size = self.tp_size

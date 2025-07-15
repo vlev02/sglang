@@ -169,6 +169,8 @@ class ModelRunner:
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
         self.gpu_id = gpu_id
+        # self.ext_cache_dim = self.server_args.ext_cache_dim,
+        # self.ext_cache_dtype = self.server_args.ext_cache_dtype,
 
         # Apply the rank zero filter to logger
         if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
@@ -963,7 +965,8 @@ class ModelRunner:
         else:
             cell_size = (
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
-                * self.model_config.head_dim
+                * (self.model_config.head_dim + self.server_args.ext_cache_dim  # increase score & weight space
+                   * torch._utils._element_size(self.server_args.ext_cache_dtype) // torch._utils._element_size(self.kv_cache_dtype))
                 * num_layers
                 * 2
                 * torch._utils._element_size(self.kv_cache_dtype)
@@ -1251,6 +1254,9 @@ class ModelRunner:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
+                    kv_compression=self.server_args.kv_cache_compression, # extend compression args
+                    ext_cache_dim=self.server_args.ext_cache_dim,
+                    ext_cache_dtype=self.server_args.ext_cache_dtype,
                 )
 
         if self.token_to_kv_pool_allocator is None:

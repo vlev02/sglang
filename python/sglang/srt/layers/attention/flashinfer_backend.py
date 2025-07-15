@@ -78,6 +78,9 @@ class FlashInferAttnBackend(AttentionBackend):
     ):
         super().__init__()
 
+        self.KV_compression = model_runner.server_args.kv_cache_compression
+        self.ext_cache_dim = model_runner.server_args.ext_cache_dim
+        self.ext_cache_dtype = model_runner.server_args.ext_cache_dtype
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
@@ -163,6 +166,16 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_wrappers_paged = []
         self.prefill_wrappers_verify = []
         self.decode_wrappers = []
+        if self.KV_compression:
+            jit_args = [
+                self.KV_compression, # url,
+                ("s_cache", "w_cache"), # additional_tensor_names,
+                ("float", "float"), # additional_tensor_dtypes,
+                ("ext_dim", ), # additional_scalar_names,
+                ("int64_t", ), # additional_scalar_dtypes
+            ]
+        else:
+            jit_args = None
         for _ in range(self.num_wrappers):
             if not skip_prefill:
                 self.prefill_wrappers_paged.append(
@@ -170,6 +183,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         self.workspace_buffer,
                         "NHD",
                         backend="fa2",
+                        jit_args=jit_args
                     )
                 )
                 self.prefill_wrappers_verify.append(
@@ -467,6 +481,12 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
+        caches = [forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)] 
+        if self.KV_compression:
+            caches.append(
+                forward_batch.token_to_kv_pool.get_sw_buffer(layer.layer_id)
+            )
+            caches += [self.ext_cache_dim]
         if not self.forward_metadata.use_ragged:
             if k is not None:
                 assert v is not None
@@ -507,7 +527,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    *caches,
                     causal=False,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,

@@ -189,6 +189,9 @@ class MHATokenToKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        kv_compression: Optional[str] = None,
+        ext_cache_dim: Optional[int] = 0,
+        ext_cache_dtype: Optional[torch.dtype] = None,
     ):
         super().__init__(
             size,
@@ -216,6 +219,9 @@ class MHATokenToKVPool(KVCache):
         else:
             self.custom_mem_pool = None
 
+        self.kv_compression = kv_compression
+        self.ext_cache_dim = ext_cache_dim
+        self.ext_cache_dtype = ext_cache_dtype
         self._create_buffers()
 
         self.layer_transfer_counter = None
@@ -253,6 +259,26 @@ class MHATokenToKVPool(KVCache):
                     )
                     for _ in range(self.layer_num)
                 ]
+                if self.kv_compression is not None:
+                    self.s_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.ext_cache_dim),
+                            dtype=self.ext_cache_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.w_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.ext_cache_dim),
+                            dtype=self.ext_cache_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                else:
+                    self.s_buffer = None
+                    self.w_buffer = None
         self.token_stride = self.head_num * self.head_dim
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer + self.v_buffer],
@@ -414,9 +440,26 @@ class MHATokenToKVPool(KVCache):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self._get_value_buffer(layer_id)
 
+    def get_score_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        if self.ext_cache_dtype != self.dtype:
+            return self.s_buffer[layer_id - self.start_layer].view(self.ext_cache_dtype)
+        return self.s_buffer[layer_id - self.start_layer]
+    
+    def get_weight_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        if self.ext_cache_dtype != self.dtype:
+            return self.w_buffer[layer_id - self.start_layer].view(self.ext_cache_dtype)
+        return self.w_buffer[layer_id - self.start_layer]
+    
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    def get_sw_buffer(self, layer_id: int):
+        return self.get_score_buffer(layer_id), self.get_weight_buffer(layer_id)
+    
     def set_kv_buffer(
         self,
         layer: RadixAttention,
