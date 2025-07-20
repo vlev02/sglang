@@ -1683,7 +1683,7 @@ class Scheduler(
         )
 
         if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
+            self.chunked_req.init_next_round_input() # tree_cache.match_prefix
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.lora_paths:
@@ -1714,7 +1714,7 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
                     break
 
-            req.init_next_round_input(self.tree_cache)
+            req.init_next_round_input(self.tree_cache) # tree_cache.match_prefix
             res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
 
             if res != AddReqResult.CONTINUE:

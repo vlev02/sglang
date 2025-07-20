@@ -60,7 +60,13 @@ class TreeNode:
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
-
+    @property
+    def host_hit_length(self):
+        host_hit_len = 0 if self.key is None else len(self.key)
+        if self.parent is not None:
+            host_hit_len += self.parent.host_hit_length
+        return host_hit_len
+    
     @property
     def evicted(self):
         return self.value is None
@@ -107,7 +113,7 @@ class RadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size
         self.disable = disable
-        self.enable_kv_cache_events = enable_kv_cache_events
+        self.enable_kv_cache_events = enable_kv_cache_events # 控制 KV cache 事件的记录与追踪，用于后续分析、同步或调试
         self.kv_event_queue = []
 
         if self.token_to_kv_pool_allocator:
@@ -386,6 +392,16 @@ class RadixCache(BasePrefixCache):
         return new_node
 
     def _insert_helper(self, node: TreeNode, key: List, value):
+        """Inserts a key-value pair into the radix tree.
+        当只匹配到一个节点的部分前缀时，分裂该节点;
+        如果存在不匹配的后缀，则创建一个新的节点并插入到树中。
+        Args:
+            node: The current node in the radix tree.
+            key: A list of token IDs to insert.
+            value: The value associated with the key.
+        Returns:
+            The total length of the prefix matched in the tree.
+        """
         node.last_access_time = time.monotonic()
         if len(key) == 0:
             return 0
