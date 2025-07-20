@@ -260,6 +260,7 @@ class Scheduler(
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.page_size = server_args.page_size
+        self.radix_block_size = server_args.radix_block_size
         self.dp_size = server_args.dp_size
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
@@ -624,10 +625,11 @@ class Scheduler(
                 )
 
             else:
-                self.tree_cache = RadixCache(
+                self.tree_cache = RadixCache( # _tree_cache init
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    page_size=self.page_size,
+                    # page_size=self.page_size,
+                    page_size=self.radix_block_size,
                     disable=server_args.disable_radix_cache,
                     enable_kv_cache_events=self.enable_kv_cache_events,
                 )
@@ -938,7 +940,7 @@ class Scheduler(
                         bid=bids[next_mb_id],
                         can_run_cuda_graph=result.can_run_cuda_graph,
                     )
-                    self.process_batch_result(mbs[next_mb_id], output_result)
+                    self.process_batch_result(mbs[next_mb_id], output_result) # update_tree_cache
                     last_mbs[next_mb_id] = mbs[next_mb_id]
 
                 # (not last rank)
@@ -1683,7 +1685,7 @@ class Scheduler(
         )
 
         if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
+            self.chunked_req.init_next_round_input() # tree_cache.match_prefix
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.lora_paths:
@@ -1714,7 +1716,7 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
                     break
 
-            req.init_next_round_input(self.tree_cache)
+            req.init_next_round_input(self.tree_cache) # tree_cache.match_prefix
             res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
 
             if res != AddReqResult.CONTINUE:
@@ -1918,9 +1920,9 @@ class Scheduler(
         launch_done: Optional[threading.Event] = None,
     ):
         if batch.forward_mode.is_decode():
-            self.process_batch_result_decode(batch, result, launch_done)
+            self.process_batch_result_decode(batch, result, launch_done) # update_tree_cache
         elif batch.forward_mode.is_extend():
-            self.process_batch_result_prefill(batch, result, launch_done)
+            self.process_batch_result_prefill(batch, result, launch_done) # update_tree_cache
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 self.tp_worker.resolve_last_batch_result(launch_done)
