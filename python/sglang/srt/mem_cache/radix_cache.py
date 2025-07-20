@@ -51,6 +51,7 @@ class TreeNode:
         self.value: Optional[torch.Tensor] = None
         self.lock_ref = 0
         self.last_access_time = time.monotonic()
+        self._host_hit_len = 0
 
         self.hit_count = 0
         # indicating the node is loading KV cache from host
@@ -62,10 +63,12 @@ class TreeNode:
         TreeNode.counter += 1
     @property
     def host_hit_length(self):
-        host_hit_len = 0 if self.key is None else len(self.key)
+        if self._host_hit_len:
+            return self._host_hit_len
+        self._host_hit_len = 0 if self.key is None else len(self.key)
         if self.parent is not None:
-            host_hit_len += self.parent.host_hit_length
-        return host_hit_len
+            self._host_hit_len += self.parent.host_hit_length
+        return self._host_hit_len
     
     @property
     def evicted(self):

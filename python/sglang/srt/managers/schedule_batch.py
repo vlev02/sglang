@@ -522,8 +522,6 @@ class Req:
         self.multimodal_inputs: Optional[MultimodalInputs] = None
 
         # Prefix info
-        # The number of tokens in the prefix_indices kv cache.
-        self.prefix_id_len: int = 0
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = []
         # Number of tokens to run prefill.
@@ -640,6 +638,14 @@ class Req:
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
+    
+    @property
+    def prefix_id_len(self):
+        """
+        The length of the prefix ids in the kv cache.
+        This is used to determine how many tokens are covered in the kv cache.
+        """
+        return self.last_node.host_hit_length
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
@@ -665,8 +671,7 @@ class Req:
             ) = tree_cache.match_prefix(
                 key=self.adjust_max_prefix_ids(),
             )
-            self.prefix_id_len = self.last_node.host_hit_length
-        self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices) # prefix_id_len
+        self.extend_input_len = len(self.fill_ids) - self.prefix_id_len # prefix_id_len
 
     def adjust_max_prefix_ids(self):
         self.fill_ids = self.origin_input_ids + self.output_ids
@@ -880,7 +885,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For extend and mixed chunekd prefill
     prefix_lens: List[int] = None
     extend_lens: List[int] = None
-    prefix_evict_lens_tensor: Optional[torch.Tensor] = None
     extend_num_tokens: Optional[int] = None
     decoding_reqs: List[Req] = None
     extend_logprob_start_lens: List[int] = None
@@ -1303,7 +1307,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
         self.prefix_lens = prefix_id_lens
         self.extend_lens = extend_lens
-        self.prefix_evict_lens_tensor = prefix_id_lens_tensor - prefix_idx_lens_tensor
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         # Write to req_to_token_pool
@@ -1571,8 +1574,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.prepare_encoder_info_decode()
         else:
             locs = self.seq_lens.clone()
-        if self.prefix_evict_lens_tensor is not None:
-            locs -= self.prefix_evict_lens_tensor
+        for i, req in enumerate(self.reqs):
+            locs[i] -= req.prefix_id_len - len(req.prefix_indices)
             
         if self.enable_overlap:
             # Do not use in-place operations in the overlap mode
