@@ -668,7 +668,7 @@ class Req:
                 self.last_node,
                 self.last_host_node,
                 self.host_hit_length,
-            ) = tree_cache.match_prefix(
+            ) = tree_cache.match_prefix( # apply_tree_cache
                 key=self.adjust_max_prefix_ids(),
             )
         self.extend_input_len = len(self.fill_ids) - self.prefix_id_len # prefix_id_len

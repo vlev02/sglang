@@ -624,7 +624,7 @@ class Scheduler(
                 )
 
             else:
-                self.tree_cache = RadixCache(
+                self.tree_cache = RadixCache( # _tree_cache init
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     page_size=self.page_size,
@@ -938,7 +938,7 @@ class Scheduler(
                         bid=bids[next_mb_id],
                         can_run_cuda_graph=result.can_run_cuda_graph,
                     )
-                    self.process_batch_result(mbs[next_mb_id], output_result)
+                    self.process_batch_result(mbs[next_mb_id], output_result) # update_tree_cache
                     last_mbs[next_mb_id] = mbs[next_mb_id]
 
                 # (not last rank)
@@ -1918,9 +1918,9 @@ class Scheduler(
         launch_done: Optional[threading.Event] = None,
     ):
         if batch.forward_mode.is_decode():
-            self.process_batch_result_decode(batch, result, launch_done)
+            self.process_batch_result_decode(batch, result, launch_done) # update_tree_cache
         elif batch.forward_mode.is_extend():
-            self.process_batch_result_prefill(batch, result, launch_done)
+            self.process_batch_result_prefill(batch, result, launch_done) # update_tree_cache
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 self.tp_worker.resolve_last_batch_result(launch_done)

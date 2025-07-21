@@ -180,45 +180,46 @@ class RadixCache(BasePrefixCache):
             last_host_node=last_node,
         )
 
-    def insert(self, key: List, value=None):
+    def insert(self, key: List, value=None, with_node=False):
         if self.disable:
             return 0
 
         if value is None:
             value = [x for x in key]
-        return self._insert_helper(self.root_node, key, value)
+        return self._insert_helper(self.root_node, key, value, with_node)
 
     def cache_finished_req(self, req: Req):
         """Cache request when it finishes."""
+        evict_len = req.prefix_id_len - len(req.prefix_indices)
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(req.origin_input_ids) + len(req.output_ids) - 1
+                req.req_pool_idx, : req.seqlen - evict_len - 1
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:-1]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
-        ]
+        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx]
 
         if self.page_size != 1:
-            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
-            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+            page_aligned_len = len(token_ids) // self.page_size * self.page_size
+            page_aligned_kv_indices = kv_indices[:page_aligned_len - evict_len].to(
                 dtype=torch.int64, copy=True
             )
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         else:
-            page_aligned_len = len(kv_indices)
-            page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            page_aligned_len = len(token_ids)
+            page_aligned_kv_indices = kv_indices[:page_aligned_len - evict_len].to(
+                dtype=torch.int64, copy=True
+            )
 
         # Radix Cache takes one ref in memory pool
-        new_prefix_len = self.insert(
-            token_ids[:page_aligned_len], page_aligned_kv_indices
+        new_prefix_len, last_match_node = self.insert(
+            token_ids[:page_aligned_len], page_aligned_kv_indices, with_node=True
         )
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[len(req.prefix_indices) : new_prefix_len]
+        self.token_to_kv_pool_allocator.free( # 将decode出来的但是匹配到了前缀的token对应的indices释放
+            kv_indices[len(req.prefix_indices) : last_match_node.host_hit_length]
         )
 
         # Remove req slot release the cache lock
@@ -229,29 +230,33 @@ class RadixCache(BasePrefixCache):
         """Cache request when it is unfinished."""
         if self.disable:
             return
-
+        
+        evict_len = req.prefix_id_len - len(req.prefix_indices)
         token_ids = req.fill_ids
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
 
         if self.page_size != 1:
-            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
-            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+            page_aligned_len = len(token_ids) // self.page_size * self.page_size
+            page_aligned_kv_indices = kv_indices[:page_aligned_len - evict_len].to(
                 dtype=torch.int64, copy=True
             )
         else:
-            page_aligned_len = len(kv_indices)
-            page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            page_aligned_len = len(token_ids)
+            page_aligned_kv_indices = kv_indices[:page_aligned_len - evict_len].to(
+                dtype=torch.int64, copy=True
+            )
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
-        self.token_to_kv_pool_allocator.free(
+        self.token_to_kv_pool_allocator.free( # why?
             kv_indices[len(req.prefix_indices) : new_prefix_len]
         )
 
         # The prefix indices could be updated, reuse it
+        # a good place to compress prefilled KV cache in a request
         new_indices, new_last_node, _, _ = self.match_prefix(page_aligned_token_ids)
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
@@ -394,7 +399,7 @@ class RadixCache(BasePrefixCache):
 
         return new_node
 
-    def _insert_helper(self, node: TreeNode, key: List, value):
+    def _insert_helper(self, node: TreeNode, key: List, value, with_node=False):
         """Inserts a key-value pair into the radix tree.
         当只匹配到一个节点的部分前缀时，分裂该节点;
         如果存在不匹配的后缀，则创建一个新的节点并插入到树中。
@@ -407,7 +412,7 @@ class RadixCache(BasePrefixCache):
         """
         node.last_access_time = time.monotonic()
         if len(key) == 0:
-            return 0
+            return (0, node) if with_node else 0
 
         child_key = self.get_child_key_fn(key)
 
@@ -427,7 +432,7 @@ class RadixCache(BasePrefixCache):
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
-        if len(key):
+        if len(key): # why not paged?
             new_node = TreeNode()
             new_node.parent = node
             new_node.key = key
@@ -435,7 +440,7 @@ class RadixCache(BasePrefixCache):
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
             self._record_store_event(new_node)
-        return total_prefix_length
+        return (total_prefix_length, node) if with_node else total_prefix_length
 
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""
