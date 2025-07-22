@@ -646,6 +646,9 @@ class Req:
         This is used to determine how many tokens are covered in the kv cache.
         """
         return self.last_node.host_hit_length
+    @property
+    def evict_len(self):
+        return self.prefix_id_len - len(self.prefix_indices)
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:

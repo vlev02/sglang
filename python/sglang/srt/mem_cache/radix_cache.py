@@ -190,7 +190,7 @@ class RadixCache(BasePrefixCache):
 
     def cache_finished_req(self, req: Req):
         """Cache request when it finishes."""
-        evict_len = req.prefix_id_len - len(req.prefix_indices)
+        evict_len = req.evict_len
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : req.seqlen - evict_len - 1
@@ -219,8 +219,9 @@ class RadixCache(BasePrefixCache):
             token_ids[:page_aligned_len], page_aligned_kv_indices, with_node=True
         )
         self.token_to_kv_pool_allocator.free( # 将decode出来的但是匹配到了前缀的token对应的indices释放
-            kv_indices[len(req.prefix_indices) : last_match_node.host_hit_length]
+            kv_indices[len(req.prefix_indices) : last_match_node.host_hit_length - evict_len]
         )
+        # a good place to compress prefilled KV cache in a request
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
@@ -231,7 +232,7 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return
         
-        evict_len = req.prefix_id_len - len(req.prefix_indices)
+        evict_len = req.evict_len
         token_ids = req.fill_ids
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
@@ -252,7 +253,7 @@ class RadixCache(BasePrefixCache):
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
         self.token_to_kv_pool_allocator.free( # why?
-            kv_indices[len(req.prefix_indices) : new_prefix_len]
+            kv_indices[len(req.prefix_indices) : new_prefix_len - evict_len]
         )
 
         # The prefix indices could be updated, reuse it
@@ -262,6 +263,15 @@ class RadixCache(BasePrefixCache):
             (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
             new_indices[len(req.prefix_indices) :],
         )
+        new_prefix_id_len = new_last_node.host_hit_length
+        tail_len = len(token_ids) - new_prefix_id_len
+        tail_start_ind = new_prefix_id_len - evict_len
+        if tail_start_ind != len(new_indices):
+            self.req_to_token_pool.write(
+                (req.req_pool_idx, slice(len(new_indices), len(new_indices) + tail_len)),
+                kv_indices[tail_start_ind, tail_start_ind + tail_len],
+            )
+        
 
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
@@ -269,7 +279,7 @@ class RadixCache(BasePrefixCache):
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         if self.page_size != 1:
             req.prefix_indices = torch.cat(
-                [new_indices, kv_indices[len(new_indices) :]]
+                [new_indices, kv_indices[tail_start_ind, tail_start_ind + tail_len]]
             )
         else:
             req.prefix_indices = new_indices
