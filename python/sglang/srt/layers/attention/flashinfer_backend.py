@@ -253,7 +253,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.prefill_wrappers_verify, False, False
             )
         else:
-            prefix_lens = forward_batch.extend_prefix_lens
+            prefix_lens = forward_batch.extend_prefix_lens # pass prefix_lens info
 
             if self.is_multimodal:
                 use_ragged = False
@@ -271,6 +271,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=use_ragged,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=None,
+                evict_lens=forward_batch.evict_lens,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged, use_ragged, extend_no_prefix
@@ -422,15 +423,17 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
+        evict_lens: Optional[torch.Tensor] = None
     ):
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 req_pool_indices[:bs],
-                seq_lens[:bs],
+                seq_lens[:bs], # KV cache length for each request
                 seq_lens_sum,
                 decode_wrappers=self.decode_cuda_graph_metadata[bs],
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+                evict_lens=evict_lens,
             )
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -629,6 +632,7 @@ class FlashInferIndicesUpdaterDecode:
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        evict_lens: Optional[torch.Tensor] = None
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -641,13 +645,21 @@ class FlashInferIndicesUpdaterDecode:
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        evict_lens:Optional[torch.Tensor] = None
     ):
+        
+        paged_kernel_lens = seq_lens
+        paged_kernel_lens_sum = seq_lens_sum
+        if evict_lens is not None:
+            assert paged_kernel_lens.shape == evict_lens.shape
+            paged_kernel_lens -= evict_lens
+            paged_kernel_lens_sum -= evict_lens.sum().item()
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
             decode_wrappers[0],
             req_pool_indices,
-            seq_lens,
-            seq_lens_sum,
+            paged_kernel_lens, # 
+            paged_kernel_lens_sum,
             self.kv_indptr[0],
             None,
             spec_info,
@@ -837,6 +849,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        evict_lens = None
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -844,7 +857,10 @@ class FlashInferIndicesUpdaterPrefill:
         else:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
-
+        if evict_lens is not None:
+            paged_kernel_lens -= evict_lens
+            paged_kernel_lens_sum -= evict_lens.sum().item()
+            
         self.call_begin_forward(
             self.prefill_wrapper_ragged,
             prefill_wrappers[0],
@@ -948,7 +964,7 @@ class FlashInferIndicesUpdaterPrefill:
         wrapper_ragged: BatchPrefillWithRaggedKVCacheWrapper,
         wrapper_paged: BatchPrefillWithPagedKVCacheWrapper,
         req_pool_indices: torch.Tensor,
-        paged_kernel_lens: torch.Tensor,
+        paged_kernel_lens: torch.Tensor, # KV cache length for each request
         paged_kernel_lens_sum: int,
         seq_lens: torch.Tensor,
         prefix_lens: torch.Tensor,
@@ -973,13 +989,13 @@ class FlashInferIndicesUpdaterPrefill:
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
+                paged_kernel_lens, # KV cache length for each request
+                kv_indptr,# the cumsom of KV cache length for each request
                 kv_start_idx,
                 kv_indices,
                 self.req_to_token.shape[1],
             )
-            qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
+            qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0) # match input len
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
         else:
@@ -998,7 +1014,7 @@ class FlashInferIndicesUpdaterPrefill:
         # extend part
         if use_ragged:
             wrapper_ragged.begin_forward(
-                qo_indptr,
+                qo_indptr, # cumsum of QO input length for each request
                 qo_indptr,
                 self.num_qo_heads,
                 self.num_kv_heads,
