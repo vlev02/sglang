@@ -256,6 +256,7 @@ class ServerArgs:
     kv_cache_compression: Optional[str] = None
     ext_cache_dim: Optional[int] = 0
     ext_cache_dtype: Optional[torch.dtype] = torch.float32
+    radix_block_size: Optional[int] = None
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -264,6 +265,9 @@ class ServerArgs:
     def __post_init__(self):
         if self.kv_cache_compression is not None:
             self.ext_cache_dim = self.ext_cache_dim or 1
+            # assert self.radix_page_size > 1
+        else:
+            self.radix_block_size = None
         # Expert parallelism
         if self.enable_ep_moe:
             self.ep_size = self.tp_size

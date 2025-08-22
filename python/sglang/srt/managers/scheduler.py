@@ -260,6 +260,7 @@ class Scheduler(
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.page_size = server_args.page_size
+        self.radix_block_size = server_args.radix_block_size
         self.dp_size = server_args.dp_size
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
@@ -627,7 +628,7 @@ class Scheduler(
                 self.tree_cache = RadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    page_size=self.page_size,
+                    page_size=self.radix_block_size or self.page_size,
                     disable=server_args.disable_radix_cache,
                     enable_kv_cache_events=self.enable_kv_cache_events,
                 )
