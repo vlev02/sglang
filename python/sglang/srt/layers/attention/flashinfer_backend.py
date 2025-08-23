@@ -215,6 +215,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
+            raise NotImplementedError() # evict_len not implement
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -225,6 +226,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrappers)
         elif forward_batch.forward_mode.is_draft_extend():
+            raise NotImplementedError() # evict_len not implement
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -239,6 +241,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.prefill_wrappers_paged, False, False
             )
         elif forward_batch.forward_mode.is_target_verify():
+            raise NotImplementedError() # evict_len not implement
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -271,6 +274,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=use_ragged,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=None,
+                evict_lens=forward_batch.evict_lens,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged, use_ragged, extend_no_prefix
@@ -422,6 +426,7 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
+        evict_lens: Optional[torch.Tensor] = None,
     ):
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -431,6 +436,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 decode_wrappers=self.decode_cuda_graph_metadata[bs],
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+                evict_lens=evict_lens,
             )
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -641,6 +647,7 @@ class FlashInferIndicesUpdaterDecode:
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        evict_lens: Optional[torch.Tensor] = None,
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
@@ -651,6 +658,7 @@ class FlashInferIndicesUpdaterDecode:
             self.kv_indptr[0],
             None,
             spec_info,
+            evict_lens=evict_lens,
         )
 
     def update_sliding_window(
@@ -732,7 +740,12 @@ class FlashInferIndicesUpdaterDecode:
         kv_start_idx: torch.Tensor,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         use_sliding_window_kv_pool: bool = False,
+        evict_lens: Optional[torch.Tensor] = None,
     ):
+        # evict calibration
+        if evict_lens is not None:
+            paged_kernel_lens -= evict_lens
+            paged_kernel_lens_sum -= evict_lens.sum().item()
         if spec_info is None:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -837,6 +850,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        evict_lens: Optional[torch.Tensor] = None,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -858,6 +872,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.qo_indptr[0],
             use_ragged,
             spec_info,
+            evict_lens=evict_lens,
         )
 
     def update_sliding_window(
@@ -958,12 +973,17 @@ class FlashInferIndicesUpdaterPrefill:
         use_ragged: bool,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         use_sliding_window_kv_pool: bool = False,
+        evict_lens: Optional[torch.Tensor] = None,
     ):
         bs = len(seq_lens)
+        # evict calibration
+        if evict_lens is not None:
+            paged_kernel_lens -= evict_lens
+            paged_kernel_lens_sum -= evict_lens.sum().item()
         if spec_info is None:
-            assert len(seq_lens) == len(req_pool_indices)
+            assert len(seq_lens) == len(req_pool_indices) # == bs
             # Normal extend
-            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
+            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0) # cumsum of input KV cache length
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(
                 paged_kernel_lens_sum + 256,
@@ -975,7 +995,7 @@ class FlashInferIndicesUpdaterPrefill:
                 req_pool_indices,
                 paged_kernel_lens,
                 kv_indptr,
-                kv_start_idx,
+                kv_start_idx, # ?
                 kv_indices,
                 self.req_to_token.shape[1],
             )
@@ -1015,6 +1035,7 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
         # cached part
+        assert kv_indptr[-1].item() == paged_kernel_lens_sum # assert by Sean
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,

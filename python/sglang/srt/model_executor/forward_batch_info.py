@@ -188,6 +188,7 @@ class ForwardBatch:
     extend_num_tokens: Optional[int] = None
     extend_seq_lens: Optional[torch.Tensor] = None
     extend_prefix_lens: Optional[torch.Tensor] = None
+    evict_lens: Optional[torch.Tensor] = None
     extend_start_loc: Optional[torch.Tensor] = None
     extend_prefix_lens_cpu: Optional[List[int]] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
@@ -375,6 +376,9 @@ class ForwardBatch:
 
         # Init position information
         if ret.forward_mode.is_decode():
+            ret.evict_lens = torch.tensor(
+                batch.evict_lens, dtype=torch.int32 # TODO: need check
+            ).to(device, non_blocking=True)
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
@@ -383,6 +387,9 @@ class ForwardBatch:
             ).to(device, non_blocking=True)
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
+            ).to(device, non_blocking=True)
+            ret.evict_lens = torch.tensor(
+                batch.evict_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
             ret.extend_num_tokens = batch.extend_num_tokens
             if support_triton(model_runner.server_args.attention_backend):
