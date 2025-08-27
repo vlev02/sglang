@@ -216,12 +216,15 @@ class RadixCache(BasePrefixCache):
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+        evict_len = req.evict_len
+        id_len = len(token_ids)
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, : id_len - evict_len
         ]
 
         if self.page_size != 1:
-            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+            page_aligned_len = id_len // self.page_size * self.page_size
+            tail_len = id_len - page_aligned_len
             page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
                 dtype=torch.int64, copy=True
             )
@@ -248,16 +251,21 @@ class RadixCache(BasePrefixCache):
             return
 
         token_ids = req.fill_ids
+        evict_len = req.evict_len
+        id_len = len(token_ids)
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, : id_len - evict_len
         ]
 
         if self.page_size != 1:
-            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
-            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+            page_aligned_len = id_len // self.page_size * self.page_size
+            tail_len = id_len - page_aligned_len
+            page_aligned_kv_indices = kv_indices[:page_aligned_len - evict_len].to(
                 dtype=torch.int64, copy=True
             )
         else:
+            tail_len = 0
+            assert not evict_len # assert by Sean
             page_aligned_len = len(kv_indices)
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
         page_aligned_token_ids = token_ids[:page_aligned_len]
@@ -270,10 +278,18 @@ class RadixCache(BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         new_indices, new_last_node, _, _ = self.match_prefix(page_aligned_token_ids)
+        assert len(req.prefix_indices) == req.tree_idxlen # assert by Sean
+        assert page_aligned_len == new_last_node.id_len
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
             new_indices[len(req.prefix_indices) :],
         )
+        if tail_len:
+            assert tail_len == id_len - new_last_node.evict_len - len(new_indices) # assert by Sean
+            self.req_to_token_pool.write(
+                (req.req_pool_idx, slice(len(new_indices), id_len - new_last_node.evict_len)),
+                kv_indices[-tail_len :],
+            )
 
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
@@ -281,7 +297,7 @@ class RadixCache(BasePrefixCache):
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         if self.page_size != 1:
             req.prefix_indices = torch.cat(
-                [new_indices, kv_indices[len(new_indices) :]]
+                [new_indices, kv_indices[page_aligned_len - evict_len :]]
             )
         else:
             req.prefix_indices = new_indices

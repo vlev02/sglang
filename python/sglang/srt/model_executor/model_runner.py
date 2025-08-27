@@ -1558,6 +1558,7 @@ class ModelRunner:
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         elif forward_batch.forward_mode.is_decode():
+            raise NotImplementedError() # evict_len not implement
             ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         elif forward_batch.forward_mode.is_extend():
             ret = self.forward_extend(
