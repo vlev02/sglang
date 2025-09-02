@@ -257,6 +257,10 @@ class ServerArgs:
     ext_cache_dim: Optional[int] = 0
     ext_cache_dtype: Optional[torch.dtype] = torch.float32
     radix_block_size: Optional[int] = None
+    radix_compression_budget: float = 0.5
+    compression_tail_budget: Optional[int] = None
+    compression_residual_budget: Optional[float] = None
+    compression_residual_cilp: Optional[int] = None
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -268,6 +272,18 @@ class ServerArgs:
             # assert self.radix_page_size > 1
         else:
             self.radix_block_size = None
+            
+        # Convert ext_cache_dtype string to torch.dtype if needed
+        if isinstance(self.ext_cache_dtype, str):
+            dtype_map = {
+                "float16": torch.float16,
+                "bfloat16": torch.bfloat16, 
+                "float32": torch.float32,
+            }
+            if self.ext_cache_dtype in dtype_map:
+                self.ext_cache_dtype = dtype_map[self.ext_cache_dtype]
+            else:
+                raise ValueError(f"Unsupported ext_cache_dtype: {self.ext_cache_dtype}")
         # Expert parallelism
         if self.enable_ep_moe:
             self.ep_size = self.tp_size
@@ -716,6 +732,31 @@ class ServerArgs:
             default=ServerArgs.kv_cache_dtype,
             choices=["auto", "fp8_e5m2", "fp8_e4m3"],
             help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
+        )
+        parser.add_argument(
+            "--kv-cache-compression",
+            type=str,
+            default=ServerArgs.kv_cache_compression,
+            help="KV cache compression method to use. Options include attention-based variants.",
+        )
+        parser.add_argument(
+            "--ext-cache-dim",
+            type=int,
+            default=ServerArgs.ext_cache_dim,
+            help="Extended cache dimension for compression. Defaults to 0, automatically set to 1 when compression is enabled.",
+        )
+        parser.add_argument(
+            "--ext-cache-dtype",
+            type=str,
+            default="float32",
+            choices=["float16", "bfloat16", "float32"],
+            help="Data type for extended cache storage used in compression.",
+        )
+        parser.add_argument(
+            "--radix-block-size",
+            type=int,
+            default=ServerArgs.radix_block_size,
+            help="Block size for radix cache. If not specified, defaults to page_size.",
         )
         parser.add_argument(
             "--quantization",
@@ -1427,6 +1468,30 @@ class ServerArgs:
             "--disable-radix-cache",
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
+        )
+        parser.add_argument(
+            "--radix-compression-budget",
+            type=float,
+            default=ServerArgs.radix_compression_budget,
+            help="Compression budget for radix cache node compression. Values between 0 and 1 represent fraction of original size, values >= 1 represent absolute token count.",
+        )
+        parser.add_argument(
+            "--compression-tail-budget",
+            type=int,
+            default=ServerArgs.compression_tail_budget,
+            help="Tail budget for compression operations. Controls the minimum sequence length before compression is applied.",
+        )
+        parser.add_argument(
+            "--compression-residual-budget",
+            type=float,
+            default=ServerArgs.compression_residual_budget,
+            help="Residual budget for compression. Values between 0 and 1 represent fraction of compression budget, values >= 1 represent absolute token count.",
+        )
+        parser.add_argument(
+            "--compression-residual-cilp",
+            type=int,
+            default=ServerArgs.compression_residual_cilp,
+            help="Residual clip parameter for compression operations.",
         )
         parser.add_argument(
             "--cuda-graph-max-bs",

@@ -1183,7 +1183,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         prefix_lens_tensor = torch.tensor(
             prefix_lens, dtype=torch.int64, device=self.device
         )
-        assert not any(evict_lens) # assert by Sean
+        # assert not any(evict_lens) # assert by Sean
         evict_lens_tensor = torch.tensor(
             evict_lens, dtype=torch.int64, device=self.device
         )

@@ -631,6 +631,11 @@ class Scheduler(
                     page_size=self.radix_block_size or self.page_size,
                     disable=server_args.disable_radix_cache,
                     enable_kv_cache_events=self.enable_kv_cache_events,
+                    kv_pool=self.tp_worker.worker.model_runner.token_to_kv_pool,
+                    compression_budget=server_args.radix_compression_budget,
+                    compression_tail_budget=server_args.compression_tail_budget,
+                    compression_residual_budget=server_args.compression_residual_budget,
+                    compression_residual_cilp=server_args.compression_residual_cilp,
                 )
 
         self.decode_mem_cache_buf_multiplier = (

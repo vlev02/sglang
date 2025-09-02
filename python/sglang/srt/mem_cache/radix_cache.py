@@ -35,6 +35,7 @@ from sglang.srt.disaggregation.kv_events import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -84,7 +85,7 @@ class TreeNode:
     
     @property
     def evict_len(self):
-        assert self.id_len == self.idx_len
+        # assert self.id_len == self.idx_len
         return self.id_len - self.idx_len
 
     @property
@@ -128,12 +129,34 @@ class RadixCache(BasePrefixCache):
         page_size: int,
         disable: bool = False,
         enable_kv_cache_events: bool = False,
+        kv_pool: Optional[MHATokenToKVPool] = None,
+        compression_budget: float = 0.5,
+        compression_tail_budget: Optional[int] = None,
+        compression_residual_budget: Optional[float | int] = None,
+        compression_residual_cilp: Optional[int] = None,
     ):
+        # Validate parameters
+        if page_size <= 0:
+            raise ValueError(f"page_size must be positive, got {page_size}")
+        if compression_budget < 0:
+            raise ValueError(f"compression_budget must be positive, got {compression_budget}")
+        if compression_tail_budget is not None and compression_tail_budget < 0:
+            raise ValueError(f"compression_tail_budget must be non-negative, got {compression_tail_budget}")
+        if compression_residual_budget is not None and compression_residual_budget < 0:
+            raise ValueError(f"compression_residual_budget must be non-negative, got {compression_residual_budget}")
+        if compression_residual_cilp is not None and compression_residual_cilp < 0:
+            raise ValueError(f"compression_residual_cilp must be a positive integral, got {compression_residual_cilp}")
+
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size
         self.disable = disable
         self.enable_kv_cache_events = enable_kv_cache_events
+        self.kv_pool = kv_pool
+        self.compression_budget = compression_budget
+        self.compression_tail_budget = compression_tail_budget if compression_tail_budget is not None else self.page_size
+        self.compression_residual_budget = compression_residual_budget if compression_residual_budget else 0
+        self.compression_residual_cilp = compression_residual_cilp if compression_residual_cilp else 0
         self.kv_event_queue = []
 
         if self.token_to_kv_pool_allocator:
@@ -265,7 +288,8 @@ class RadixCache(BasePrefixCache):
             )
         else:
             tail_len = 0
-            assert not evict_len # assert by Sean
+            if evict_len:
+                raise ValueError(f"Expected evict_len to be 0 for page_size=1, got {evict_len}")
             page_aligned_len = len(kv_indices)
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
         page_aligned_token_ids = token_ids[:page_aligned_len]
@@ -458,15 +482,17 @@ class RadixCache(BasePrefixCache):
             child_key = self.get_child_key_fn(key)
             assert len(child_key) == self.page_size
             child_value = value[:self.page_size]
+            key, value = key[self.page_size:], value[self.page_size:]
             new_node = TreeNode()
             new_node.parent = node
             new_node.key = child_key
             new_node.value = child_value
+            # new_node.value = child_value[:1] + child_value[2:]
             node.children[child_key] = new_node
+            if len(key) >= self.compression_tail_budget:
+                self._compress_node(new_node)
             self.evictable_size_ += len(new_node.value)
             self._record_store_event(new_node)
-            key, value = key[self.page_size:], value[self.page_size:]
-            
             
         if len(key):
             new_node = TreeNode()
@@ -478,6 +504,60 @@ class RadixCache(BasePrefixCache):
             self._record_store_event(new_node)
         return total_prefix_length
 
+    def _compress_node(
+        self, 
+        node: TreeNode, 
+        budget: Optional[int | float] = None,
+        residual_budget: Optional[int | float] = None,
+        residual_clip: Optional[int] = None,
+        ):
+        value = node.value
+        kv_pool = self.kv_pool
+        size = len(value)
+        if size < 1:
+            return
+        
+        # Use configured budget if not provided
+        if budget is None:
+            budget = self.compression_budget
+        if residual_budget is None:
+            residual_budget = self.compression_residual_budget
+        if residual_clip is None:
+            residual_clip = self.compression_residual_cilp
+            
+        # Validate and process budget
+        if budget <= 0:
+            raise ValueError(f"Invalid budget value: {budget=}")
+        elif budget < 1:
+            budget = int(size * budget)
+        budget = min(max(1, budget), size)  # Ensure budget doesn't exceed available tokens
+        
+        # Validate and process residual budget
+        if residual_budget < 0:
+            raise ValueError(f"Invalid residual_budget value: {residual_budget=}")
+        elif residual_budget < 1:
+            residual_budget = int(budget * residual_budget)
+        residual_budget = max(0, min(residual_budget, budget))  # Ensure residual_budget is within bounds
+        
+        if residual_budget > budget:
+            raise ValueError(f"residual_budget ({residual_budget}) cannot exceed budget ({budget})")
+        # top_k = budget - residual_budget
+        
+        # alloc
+        out_cache_loc = self.token_to_kv_pool_allocator.alloc(budget)
+        
+        # select
+        for layer_idx in range(kv_pool.layer_num):
+            _, topk_indices = torch.topk(kv_pool.s_buffer[layer_idx][value, :, 0], budget, dim=0)
+            kv_pool.k_buffer[layer_idx][out_cache_loc] = torch.gather(kv_pool.k_buffer[layer_idx][value, ...], 0, topk_indices.unsqueeze(-1).expand(-1, -1, kv_pool.k_buffer[layer_idx].size(-1)))
+            kv_pool.v_buffer[layer_idx][out_cache_loc] = torch.gather(kv_pool.v_buffer[layer_idx][value, ...], 0, topk_indices.unsqueeze(-1).expand(-1, -1, kv_pool.v_buffer[layer_idx].size(-1)))
+            
+        # free
+        self.token_to_kv_pool_allocator.free(value)
+        node.value = out_cache_loc
+        return
+        
+        
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""
         stack = [(node, indent)]
