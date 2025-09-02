@@ -260,7 +260,7 @@ class ServerArgs:
     radix_compression_budget: float = 0.5
     compression_tail_budget: Optional[int] = None
     compression_residual_budget: Optional[float] = None
-    compression_residual_cilp: Optional[int] = None
+    compression_residual_clip: Optional[int] = None
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -1488,9 +1488,9 @@ class ServerArgs:
             help="Residual budget for compression. Values between 0 and 1 represent fraction of compression budget, values >= 1 represent absolute token count.",
         )
         parser.add_argument(
-            "--compression-residual-cilp",
+            "--compression-residual-clip",
             type=int,
-            default=ServerArgs.compression_residual_cilp,
+            default=ServerArgs.compression_residual_clip,
             help="Residual clip parameter for compression operations.",
         )
         parser.add_argument(

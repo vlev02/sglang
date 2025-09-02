@@ -635,7 +635,7 @@ class Scheduler(
                     compression_budget=server_args.radix_compression_budget,
                     compression_tail_budget=server_args.compression_tail_budget,
                     compression_residual_budget=server_args.compression_residual_budget,
-                    compression_residual_cilp=server_args.compression_residual_cilp,
+                    compression_residual_clip=server_args.compression_residual_clip,
                 )
 
         self.decode_mem_cache_buf_multiplier = (

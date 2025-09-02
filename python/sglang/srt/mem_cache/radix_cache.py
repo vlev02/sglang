@@ -133,7 +133,7 @@ class RadixCache(BasePrefixCache):
         compression_budget: float = 0.5,
         compression_tail_budget: Optional[int] = None,
         compression_residual_budget: Optional[float | int] = None,
-        compression_residual_cilp: Optional[int] = None,
+        compression_residual_clip: Optional[int] = None,
     ):
         # Validate parameters
         if page_size <= 0:
@@ -144,8 +144,8 @@ class RadixCache(BasePrefixCache):
             raise ValueError(f"compression_tail_budget must be non-negative, got {compression_tail_budget}")
         if compression_residual_budget is not None and compression_residual_budget < 0:
             raise ValueError(f"compression_residual_budget must be non-negative, got {compression_residual_budget}")
-        if compression_residual_cilp is not None and compression_residual_cilp < 0:
-            raise ValueError(f"compression_residual_cilp must be a positive integral, got {compression_residual_cilp}")
+        if compression_residual_clip is not None and compression_residual_clip < 0:
+            raise ValueError(f"compression_residual_clip must be a positive integral, got {compression_residual_clip}")
 
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -156,7 +156,7 @@ class RadixCache(BasePrefixCache):
         self.compression_budget = compression_budget
         self.compression_tail_budget = compression_tail_budget if compression_tail_budget is not None else self.page_size
         self.compression_residual_budget = compression_residual_budget if compression_residual_budget else 0
-        self.compression_residual_cilp = compression_residual_cilp if compression_residual_cilp else 0
+        self.compression_residual_clip = compression_residual_clip if compression_residual_clip else 0
         self.kv_event_queue = []
 
         if self.token_to_kv_pool_allocator:
@@ -523,7 +523,7 @@ class RadixCache(BasePrefixCache):
         if residual_budget is None:
             residual_budget = self.compression_residual_budget
         if residual_clip is None:
-            residual_clip = self.compression_residual_cilp
+            residual_clip = self.compression_residual_clip
             
         # Validate and process budget
         if budget <= 0:
