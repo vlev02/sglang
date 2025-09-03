@@ -468,7 +468,7 @@ class Req:
         # Each decode stage's output ids
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
-        # self.fill_ids = []
+        self.fill_ids = []
         self.session_id = session_id
         self.input_embeds = input_embeds
 
@@ -637,10 +637,10 @@ class Req:
 
     @property
     def seqlen(self):
-        return len(self.fill_ids)
+        return len(self.fill_ids_)
     
     @property
-    def fill_ids(self,):
+    def fill_ids_(self,):
         return self.origin_input_ids + self.output_ids
     
     @property
@@ -669,7 +669,7 @@ class Req:
         self,
         tree_cache: Optional[BasePrefixCache] = None,
     ):
-        # self.fill_ids = self.origin_input_ids + self.output_ids
+        self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
             (
                 self.prefix_indices,
@@ -682,7 +682,7 @@ class Req:
         self.extend_input_len = self.seqlen - self.tree_idlen
 
     def adjust_max_prefix_ids(self):
-        # self.fill_ids = self.origin_input_ids + self.output_ids
+        self.fill_ids = self.origin_input_ids + self.output_ids
         input_len = self.seqlen
 
         # FIXME: To work around some bugs in logprob computation, we need to ensure each

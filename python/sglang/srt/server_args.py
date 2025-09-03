@@ -257,7 +257,7 @@ class ServerArgs:
     ext_cache_dim: Optional[int] = 0
     ext_cache_dtype: Optional[torch.dtype] = torch.float32
     radix_block_size: Optional[int] = None
-    radix_compression_budget: float = 0.5
+    radix_compression_budget: Optional[float] = None
     compression_tail_budget: Optional[int] = None
     compression_residual_budget: Optional[float] = None
     compression_residual_clip: Optional[int] = None

@@ -130,7 +130,7 @@ class RadixCache(BasePrefixCache):
         disable: bool = False,
         enable_kv_cache_events: bool = False,
         kv_pool: Optional[MHATokenToKVPool] = None,
-        compression_budget: float = 0.5,
+        compression_budget: Optional[float] = None,
         compression_tail_budget: Optional[int] = None,
         compression_residual_budget: Optional[float | int] = None,
         compression_residual_clip: Optional[int] = None,
@@ -138,7 +138,7 @@ class RadixCache(BasePrefixCache):
         # Validate parameters
         if page_size <= 0:
             raise ValueError(f"page_size must be positive, got {page_size}")
-        if compression_budget < 0:
+        if compression_budget is not None and compression_budget < 0:
             raise ValueError(f"compression_budget must be positive, got {compression_budget}")
         if compression_tail_budget is not None and compression_tail_budget < 0:
             raise ValueError(f"compression_tail_budget must be non-negative, got {compression_tail_budget}")
@@ -303,7 +303,7 @@ class RadixCache(BasePrefixCache):
         # The prefix indices could be updated, reuse it
         new_indices, new_last_node, _, _ = self.match_prefix(page_aligned_token_ids)
         assert len(req.prefix_indices) == req.tree_idxlen # assert by Sean
-        assert page_aligned_len == new_last_node.id_len
+        assert page_aligned_len == new_last_node.id_len, f"{page_aligned_len=}, {new_last_node.id_len}"
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
             new_indices[len(req.prefix_indices) :],
