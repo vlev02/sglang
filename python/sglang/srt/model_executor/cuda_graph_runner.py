@@ -274,6 +274,7 @@ class CudaGraphRunner:
             self.seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
+            self.evict_lens = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
@@ -681,6 +682,10 @@ class CudaGraphRunner:
                 num_token_non_padded=len(forward_batch.input_ids),
                 spec_info=forward_batch.spec_info,
             )
+        if forward_batch.evict_lens is not None:
+            if bs != raw_bs:
+                self.evict_lens.zero_()
+            self.evict_lens[:raw_bs].copy_(forward_batch.evict_lens)
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = self.custom_mask
         # Attention backend
@@ -693,7 +698,7 @@ class CudaGraphRunner:
             self.capture_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=self.seq_lens_cpu[:bs],
-            evict_lens=forward_batch.evict_lens,
+            evict_lens=self.evict_lens[:bs] if forward_batch.evict_lens is not None else None,
         )
 
         # Store fields

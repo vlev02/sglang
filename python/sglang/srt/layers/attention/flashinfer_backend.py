@@ -436,7 +436,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 decode_wrappers=self.decode_cuda_graph_metadata[bs],
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
-                evict_lens=evict_lens,
+                evict_lens=evict_lens[:bs] if evict_lens is not None else None,
             )
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -635,6 +635,7 @@ class FlashInferIndicesUpdaterDecode:
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        evict_lens: Optional[torch.Tensor] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -669,6 +670,7 @@ class FlashInferIndicesUpdaterDecode:
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        evict_lens: Optional[torch.Tensor] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -698,6 +700,7 @@ class FlashInferIndicesUpdaterDecode:
                 kv_start_idx_tmp,
                 spec_info,
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
+                evict_lens=evict_lens,
             )
 
     def update_cross_attention(
@@ -708,6 +711,7 @@ class FlashInferIndicesUpdaterDecode:
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        evict_lens: Optional[torch.Tensor] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -728,6 +732,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.kv_indptr[wrapper_id],
                 kv_start_idx,
                 spec_info,
+                evict_lens=evict_lens,
             )
 
     def call_begin_forward(
