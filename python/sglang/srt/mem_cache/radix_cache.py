@@ -248,10 +248,10 @@ class RadixCache(BasePrefixCache):
         if self.page_size != 1:
             page_aligned_len = id_len // self.page_size * self.page_size
             tail_len = id_len - page_aligned_len
-            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+            page_aligned_kv_indices = kv_indices[:page_aligned_len - evict_len].to(
                 dtype=torch.int64, copy=True
             )
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len - evict_len:])
         else:
             page_aligned_len = len(kv_indices)
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
@@ -303,7 +303,7 @@ class RadixCache(BasePrefixCache):
         # The prefix indices could be updated, reuse it
         new_indices, new_last_node, _, _ = self.match_prefix(page_aligned_token_ids)
         assert len(req.prefix_indices) == req.tree_idxlen # assert by Sean
-        assert page_aligned_len == new_last_node.id_len, f"{page_aligned_len=}, {new_last_node.id_len}"
+        assert page_aligned_len == new_last_node.id_len, f"{page_aligned_len=}, {new_last_node.id_len=}"
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
             new_indices[len(req.prefix_indices) :],
@@ -312,7 +312,7 @@ class RadixCache(BasePrefixCache):
             assert tail_len == id_len - new_last_node.evict_len - len(new_indices) # assert by Sean
             self.req_to_token_pool.write(
                 (req.req_pool_idx, slice(len(new_indices), id_len - new_last_node.evict_len)),
-                kv_indices[-tail_len :],
+                kv_indices[-tail_len :].clone(),
             )
 
         self.dec_lock_ref(req.last_node)
@@ -469,7 +469,7 @@ class RadixCache(BasePrefixCache):
                 assert prefix_len == self.page_size, f"{prefix_len=} == {self.page_size=}" # assert by Sean
             total_prefix_length += prefix_len
             key = key[prefix_len:]
-            value = value[prefix_len:]
+            # value = value[prefix_len:]
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -477,7 +477,7 @@ class RadixCache(BasePrefixCache):
 
             if len(key):
                 child_key = self.get_child_key_fn(key)
-
+        value = value[-len(key):]
         while self.page_size > 1 and len(key): # paged node key
             child_key = self.get_child_key_fn(key)
             assert len(child_key) == self.page_size
@@ -489,12 +489,14 @@ class RadixCache(BasePrefixCache):
             new_node.value = child_value
             # new_node.value = child_value[:1] + child_value[2:]
             node.children[child_key] = new_node
-            if len(key) >= self.compression_tail_budget:
+            if len(new_node.key) >= self.compression_tail_budget:
                 self._compress_node(new_node)
             self.evictable_size_ += len(new_node.value)
             self._record_store_event(new_node)
+            node = new_node
             
         if len(key):
+            assert self.page_size == 1 # assert by sean
             new_node = TreeNode()
             new_node.parent = node
             new_node.key = key
@@ -577,11 +579,12 @@ class RadixCache(BasePrefixCache):
                 ), f"{key=}, {self.get_child_key_fn(child.key)=}"
 
     def _delete_leaf(self, node):
+        indices_len = len(node.value)
         for k, v in node.parent.children.items():
             if v == node:
                 break
         del node.parent.children[k]
-        self.evictable_size_ -= len(node.key)
+        self.evictable_size_ -= indices_len
 
     def _total_size_helper(self):
         total_size = 0
