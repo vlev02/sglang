@@ -1317,7 +1317,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     )
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
-        self.seq_lens_sum = sum(seq_lens) # TODO: OK
+        self.seq_lens_sum = sum(seq_lens)
 
         if self.return_logprob:
             self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
@@ -1325,7 +1325,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
         self.extend_num_tokens = extend_num_tokens
-        self.prefix_lens = prefix_lens # TODO: OK
+        self.prefix_lens = prefix_lens
         self.extend_lens = extend_lens
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 

@@ -983,7 +983,7 @@ class FlashInferIndicesUpdaterPrefill:
         bs = len(seq_lens)
         # evict calibration
         if evict_lens is not None:
-            paged_kernel_lens -= evict_lens
+            paged_kernel_lens = paged_kernel_lens.detach().clone() - evict_lens
             paged_kernel_lens_sum -= evict_lens.sum().item()
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices) # == bs
