@@ -544,15 +544,20 @@ class RadixCache(BasePrefixCache):
         if residual_budget > budget:
             raise ValueError(f"residual_budget ({residual_budget}) cannot exceed budget ({budget})")
         # top_k = budget - residual_budget
-        
+        # return 
+    
         # alloc
         out_cache_loc = self.token_to_kv_pool_allocator.alloc(budget)
+        # out_cache_loc = torch.flip(out_cache_loc, dims=[0])
         
         # select
         for layer_idx in range(kv_pool.layer_num):
             _, topk_indices = torch.topk(kv_pool.s_buffer[layer_idx][value, :, 0], budget, dim=0)
+            # topk_indices = torch.arange(len(value), device=out_cache_loc.device)[..., None].expand(-1, kv_pool.k_buffer[layer_idx].size(1))
             kv_pool.k_buffer[layer_idx][out_cache_loc] = torch.gather(kv_pool.k_buffer[layer_idx][value, ...], 0, topk_indices.unsqueeze(-1).expand(-1, -1, kv_pool.k_buffer[layer_idx].size(-1)))
             kv_pool.v_buffer[layer_idx][out_cache_loc] = torch.gather(kv_pool.v_buffer[layer_idx][value, ...], 0, topk_indices.unsqueeze(-1).expand(-1, -1, kv_pool.v_buffer[layer_idx].size(-1)))
+            # kv_pool.k_buffer[layer_idx][out_cache_loc] = kv_pool.k_buffer[layer_idx][value, ...]
+            # kv_pool.v_buffer[layer_idx][out_cache_loc] = kv_pool.v_buffer[layer_idx][value, ...]
             
         # free
         self.token_to_kv_pool_allocator.free(value)

@@ -637,23 +637,19 @@ class Req:
 
     @property
     def seqlen(self):
-        return len(self.fill_ids_)
-    
-    @property
-    def fill_ids_(self,):
-        return self.origin_input_ids + self.output_ids
+        return len(self.origin_input_ids) + len(self.output_ids)
     
     @property
     def tree_idlen(self):
-        return self.last_node.id_len
+        return self.last_node.id_len#  if self.last_node is not None else 0
     
     @property
     def tree_idxlen(self):
-        return self.last_node.idx_len
+        return self.last_node.idx_len#  if self.last_node is not None else 0
     
     @property
     def evict_len(self):
-        return self.last_node.evict_len
+        return self.last_node.evict_len#  if self.last_node is not None else 0
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
@@ -679,11 +675,11 @@ class Req:
             ) = tree_cache.match_prefix(
                 key=self.adjust_max_prefix_ids(),
             )
-        self.extend_input_len = self.seqlen - self.tree_idlen
+        self.extend_input_len = len(self.fill_ids) - self.tree_idlen
 
     def adjust_max_prefix_ids(self):
         self.fill_ids = self.origin_input_ids + self.output_ids
-        input_len = self.seqlen
+        input_len = len(self.fill_ids)
 
         # FIXME: To work around some bugs in logprob computation, we need to ensure each
         # request has at least one token. Later, we can relax this requirement and use `input_len`.
@@ -1161,11 +1157,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reqs = self.reqs
         input_ids = [r.fill_ids[r.tree_idlen :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
-        seq_lens = [r.seqlen for r in reqs]
+        seq_lens = [len(r.fill_ids) for r in reqs]
         prefix_lens = [r.tree_idlen for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
         evict_lens = [r.evict_len for r in reqs]
-        assert extend_num_tokens == sum(extend_lens)
+        assert extend_num_tokens == sum(extend_lens), f"{extend_num_tokens=} == {sum(extend_lens)=}"
 
         token_type_ids = [
             r.token_type_ids for r in reqs if r.token_type_ids is not None
@@ -1195,7 +1191,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ).to(self.device, non_blocking=True)
 
         extend_lens_tensor = seq_lens_tensor - prefix_lens_tensor
-        assert extend_num_tokens == extend_lens_tensor.sum().item()
+        assert extend_num_tokens == extend_lens_tensor.sum().item(), f"{extend_num_tokens=} != {extend_lens_tensor.sum().item()=} {[r.is_chunked for r in reqs]}"
 
         # Copy prefix and do some basic check
         input_embeds = []
@@ -1207,7 +1203,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             assert seq_len - pre_len == req.extend_input_len
 
             if pre_len > 0:
-                assert req.tree_idxlen == len(req.prefix_indices) # assert by Sean
+                assert req.tree_idxlen == len(req.prefix_indices), f"{req.tree_idxlen =} {len(req.prefix_indices)=}" # assert by Sean
                 self.req_to_token_pool.write(
                     (req.req_pool_idx, slice(0, req.tree_idxlen)), req.prefix_indices
                 )
@@ -1253,7 +1249,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # extend_input_logprob_token_id = [4, 0]
                 global_start_idx, global_end_idx = (
                     req.tree_idlen,
-                    req.seqlen,
+                    len(req.fill_ids),
                 )
                 # Apply logprob_start_len
                 if global_start_idx < req.logprob_start_len:

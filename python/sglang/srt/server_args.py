@@ -267,12 +267,6 @@ class ServerArgs:
     sm_group_num: int = 3
 
     def __post_init__(self):
-        if self.kv_cache_compression is not None:
-            self.ext_cache_dim = self.ext_cache_dim or 1
-            # assert self.radix_page_size > 1
-        else:
-            self.radix_block_size = None
-            
         # Convert ext_cache_dtype string to torch.dtype if needed
         if isinstance(self.ext_cache_dtype, str):
             dtype_map = {
@@ -379,6 +373,16 @@ class ServerArgs:
                 self.chunked_prefill_size = 4096
         assert self.chunked_prefill_size % self.page_size == 0
 
+        if self.kv_cache_compression is not None:
+            self.ext_cache_dim = self.ext_cache_dim or 1
+            # assert self.radix_block_size > 1
+            assert self.disable_overlap_schedule # TODO: enable overlap_schedule
+            if self.radix_block_size:
+                self.chunked_prefill_size = self.chunked_prefill_size // self.radix_block_size * self.radix_block_size
+                assert self.chunked_prefill_size % self.radix_block_size == 0
+        else:
+            self.radix_block_size = None
+            
         # Set cuda graph max batch size
         if self.cuda_graph_max_bs is None:
             # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance. However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.

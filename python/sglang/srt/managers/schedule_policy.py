@@ -177,7 +177,7 @@ class SchedulePolicy:
             # We prefer to set IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD > 0 because too small
             # threshold means we cannot use in-batch prefix caching for short prefixes.
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
-            if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
+            if r.tree_idlen <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 in_batch_matching_prefixes, _, _, _ = (
                     self.waiting_queue_radix_tree.match_prefix(
                         rid=r.rid, key=prefix_ids
@@ -202,7 +202,7 @@ class SchedulePolicy:
         """Sorts the waiting queue based on the longest prefix match."""
         waiting_queue.sort(
             key=lambda r: (
-                -len(r.prefix_indices)
+                -r.tree_idlen
                 if r.rid not in temporary_deprioritized
                 else float("inf")
             )
@@ -382,7 +382,7 @@ class PrefillAdder:
     def add_chunked_req(self, req: Req):
         truncated = req.extend_input_len > self.rem_chunk_tokens
         req.extend_input_len = min(req.extend_input_len, self.rem_chunk_tokens)
-        req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+        req.fill_ids = req.fill_ids[: req.tree_idlen + req.extend_input_len]
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
@@ -503,7 +503,7 @@ class PrefillAdder:
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = req.extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
-        prefix_len = len(req.prefix_indices)
+        prefix_len = req.tree_idlen
 
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
@@ -521,15 +521,15 @@ class PrefillAdder:
                     req.last_host_node, req.host_hit_length
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-                prefix_len = len(req.prefix_indices)
+                req.extend_input_len = len(req.fill_ids) - req.tree_idlen
+                prefix_len = req.tree_idlen
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
 
-            if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+            if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens: # TODO: rem_chunk_tokens should align with page_size
                 # Non-chunked prefill
                 self.can_run_list.append(req)
                 if self.is_hybrid:
@@ -553,7 +553,7 @@ class PrefillAdder:
 
                 # Chunked prefill
                 req.extend_input_len = trunc_len
-                req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
+                req.fill_ids = req.fill_ids[: req.tree_idlen + trunc_len]
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
