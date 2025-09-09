@@ -154,18 +154,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 for _ in range(self.num_wrappers)
             ]
 
-        fmha_backend = "auto"
-        if is_sm100_supported():
-            fmha_backend = "cutlass"
-        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=fmha_backend
-        )
-
-        # Two wrappers: one for sliding window attention and one for full attention.
-        # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
-        self.prefill_wrappers_paged = []
-        self.prefill_wrappers_verify = []
-        self.decode_wrappers = []
         if self.KV_compression:
             jit_args = [
                 self.KV_compression, # url,
@@ -176,6 +164,18 @@ class FlashInferAttnBackend(AttentionBackend):
             ]
         else:
             jit_args = None
+        fmha_backend = "auto"
+        if is_sm100_supported():
+            fmha_backend = "cutlass"
+        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+            self.workspace_buffer, "NHD", backend=fmha_backend, jit_args=jit_args
+        )
+
+        # Two wrappers: one for sliding window attention and one for full attention.
+        # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
+        self.prefill_wrappers_paged = []
+        self.prefill_wrappers_verify = []
+        self.decode_wrappers = []
         for _ in range(self.num_wrappers):
             if not skip_prefill:
                 self.prefill_wrappers_paged.append(
@@ -197,6 +197,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     self.workspace_buffer,
                     "NHD",
                     use_tensor_cores=self.decode_use_tensor_cores,
+                    # jit_args=jit_args,
                 )
             )
 
@@ -487,13 +488,14 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
-        caches = [forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)] 
+        caches = [] 
         if self.KV_compression:
             caches.append(
                 forward_batch.token_to_kv_pool.get_sw_buffer(layer.layer_id)
             )
             caches += [self.ext_cache_dim]
         if not self.forward_metadata.use_ragged:
+            raise NotImplementedError() # add by sean
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
@@ -517,6 +519,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                    *caches,
                     causal=True,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
@@ -527,12 +530,14 @@ class FlashInferAttnBackend(AttentionBackend):
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                    *caches,
                     causal=True,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
                 )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                     *caches,
                     causal=False,
                     sm_scale=layer.scaling,
