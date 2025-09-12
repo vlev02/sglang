@@ -440,6 +440,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 evict_lens=evict_lens[:bs] if evict_lens is not None else None,
             )
         elif forward_mode.is_target_verify():
+            raise NotImplementedError() # add by sean
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -451,6 +452,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
         elif forward_mode.is_draft_extend():
+            raise NotImplementedError() # add by sean
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -488,12 +490,12 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
-        caches = [] 
+        comp_args = [] 
         if self.KV_compression:
-            caches.append(
+            comp_args.append(
                 forward_batch.token_to_kv_pool.get_sw_buffer(layer.layer_id)
             )
-            caches += [self.ext_cache_dim]
+            comp_args += [self.ext_cache_dim]
         if not self.forward_metadata.use_ragged:
             raise NotImplementedError() # add by sean
             if k is not None:
@@ -519,7 +521,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                    *caches,
+                    *comp_args,
                     causal=True,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
@@ -530,7 +532,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                    *caches,
+                    *comp_args,
                     causal=True,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
@@ -538,7 +540,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                    *caches,
+                    *comp_args,
                     causal=False,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
