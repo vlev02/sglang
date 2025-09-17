@@ -164,11 +164,12 @@ class FlashInferAttnBackend(AttentionBackend):
             ]
         else:
             jit_args = None
+        self.jit_args = jit_args
         fmha_backend = "auto"
         if is_sm100_supported():
             fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=fmha_backend, jit_args=jit_args
+            self.workspace_buffer, "NHD", backend=fmha_backend, jit_args=self.jit_args
         )
 
         # Two wrappers: one for sliding window attention and one for full attention.
@@ -183,7 +184,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         self.workspace_buffer,
                         "NHD",
                         backend="fa2",
-                        jit_args=jit_args
+                        jit_args=self.jit_args
                     )
                 )
                 self.prefill_wrappers_verify.append(
@@ -197,7 +198,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     self.workspace_buffer,
                     "NHD",
                     use_tensor_cores=self.decode_use_tensor_cores,
-                    # jit_args=jit_args,
+                    jit_args=self.jit_args,
                 )
             )
 
@@ -339,6 +340,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         paged_kv_last_page_len_buffer=self.kv_last_page_len[
                             :num_tokens
                         ],
+                        jit_args=self.jit_args,
                     )
                 )
             seq_lens_sum = seq_lens.sum().item()
@@ -357,6 +359,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     fast_decode_plan, decode_wrappers[i]
                 )
         elif forward_mode.is_target_verify():
+            raise NotImplementedError() # add by sean
             prefill_wrappers = []
             for i in range(self.num_wrappers):
                 prefill_wrappers.append(
@@ -386,6 +389,7 @@ class FlashInferAttnBackend(AttentionBackend):
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_draft_extend():
+            raise NotImplementedError() # add by sean
             prefill_wrappers = []
             for i in range(self.num_wrappers):
                 prefill_wrappers.append(
@@ -579,11 +583,18 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
-
+        
+        comp_args = [] 
+        if self.KV_compression:
+            comp_args.append(
+                forward_batch.token_to_kv_pool.get_sw_buffer(layer.layer_id)
+            )
+            comp_args += [self.ext_cache_dim]
         # Call the wrapped function
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            *comp_args,
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
             k_scale=layer.k_scale,
@@ -756,7 +767,7 @@ class FlashInferIndicesUpdaterDecode:
     ):
         # evict calibration
         if evict_lens is not None:
-            paged_kernel_lens -= evict_lens
+            paged_kernel_lens = paged_kernel_lens.detach().clone() - evict_lens
             paged_kernel_lens_sum -= evict_lens.sum().item()
         if spec_info is None:
             bs = len(req_pool_indices)
