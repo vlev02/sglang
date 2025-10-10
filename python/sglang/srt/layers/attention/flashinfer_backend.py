@@ -157,8 +157,8 @@ class FlashInferAttnBackend(AttentionBackend):
         if self.KV_compression:
             jit_args = [
                 self.KV_compression, # url,
-                ("s_cache", "w_cache"), # additional_tensor_names,
-                ("float", "float"), # additional_tensor_dtypes,
+                ("s_cache", "w_cache", "ragged_indices"), # additional_tensor_names,
+                ("float", "float", "int64_t"), # additional_tensor_dtypes,
                 ("ext_dim", ), # additional_scalar_names,
                 ("int64_t", ), # additional_scalar_dtypes
             ]
@@ -499,7 +499,7 @@ class FlashInferAttnBackend(AttentionBackend):
             comp_args.append(
                 forward_batch.token_to_kv_pool.get_sw_buffer(layer.layer_id)
             )
-            comp_args += [self.ext_cache_dim]
+            comp_args += [cache_loc.contiguous(), self.ext_cache_dim]
         if not self.forward_metadata.use_ragged:
             raise NotImplementedError() # add by sean
             if k is not None:
@@ -589,7 +589,7 @@ class FlashInferAttnBackend(AttentionBackend):
             comp_args.append(
                 forward_batch.token_to_kv_pool.get_sw_buffer(layer.layer_id)
             )
-            comp_args += [self.ext_cache_dim]
+            comp_args += [cache_loc, self.ext_cache_dim]
         # Call the wrapped function
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
