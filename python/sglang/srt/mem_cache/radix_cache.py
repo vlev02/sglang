@@ -558,7 +558,12 @@ class RadixCache(BasePrefixCache):
             kv_pool.v_buffer[layer_idx][out_cache_loc] = torch.gather(kv_pool.v_buffer[layer_idx][value, ...], 0, topk_indices.unsqueeze(-1).expand(-1, -1, kv_pool.v_buffer[layer_idx].size(-1)))
             # kv_pool.k_buffer[layer_idx][out_cache_loc] = kv_pool.k_buffer[layer_idx][value, ...]
             # kv_pool.v_buffer[layer_idx][out_cache_loc] = kv_pool.v_buffer[layer_idx][value, ...]
-            
+
+            # Reset buffers: clear old locations and initialize new locations
+            kv_pool.s_buffer[layer_idx][value] = 0
+            kv_pool.w_buffer[layer_idx][value] = -2
+            kv_pool.w_buffer[layer_idx][out_cache_loc] = 0
+
         # free
         self.token_to_kv_pool_allocator.free(value)
         node.value = out_cache_loc

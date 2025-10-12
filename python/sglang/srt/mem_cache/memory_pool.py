@@ -269,8 +269,9 @@ class MHATokenToKVPool(KVCache):
                         for _ in range(self.layer_num)
                     ]
                     self.w_buffer = [
-                        torch.zeros(
+                        torch.full(
                             (self.size + self.page_size, self.head_num, self.ext_cache_dim),
+                            fill_value=-1.0,
                             dtype=self.ext_cache_dtype,
                             device=self.device,
                         )

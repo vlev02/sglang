@@ -80,6 +80,8 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.KV_compression = model_runner.server_args.kv_cache_compression
         self.ext_cache_dim = model_runner.server_args.ext_cache_dim
+        self.q_win_size = model_runner.server_args.q_win_size
+        self.update_rate = model_runner.server_args.update_rate
         self.ext_cache_dtype = model_runner.server_args.ext_cache_dtype
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
@@ -159,8 +161,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.KV_compression, # url,
                 ("s_cache", "w_cache", "ragged_indices"), # additional_tensor_names,
                 ("float", "float", "int64_t"), # additional_tensor_dtypes,
-                ("ext_dim", ), # additional_scalar_names,
-                ("int64_t", ), # additional_scalar_dtypes
+                ("ext_dim", "q_win_size", "update_rate"), # additional_scalar_names,
+                ("int64_t", "int64_t", "double"), # additional_scalar_dtypes (PyTorch requires double for float scalars)
             ]
         else:
             jit_args = None
@@ -494,12 +496,12 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
-        comp_args = [] 
+        comp_args = []
         if self.KV_compression:
             comp_args.append(
                 forward_batch.token_to_kv_pool.get_sw_buffer(layer.layer_id)
             )
-            comp_args += [cache_loc.contiguous(), self.ext_cache_dim]
+            comp_args += [cache_loc.contiguous(), self.ext_cache_dim, self.q_win_size, self.update_rate]
         if not self.forward_metadata.use_ragged:
             raise NotImplementedError() # add by sean
             if k is not None:
@@ -584,12 +586,12 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
         
-        comp_args = [] 
+        comp_args = []
         if self.KV_compression:
             comp_args.append(
                 forward_batch.token_to_kv_pool.get_sw_buffer(layer.layer_id)
             )
-            comp_args += [cache_loc, self.ext_cache_dim]
+            comp_args += [cache_loc, self.ext_cache_dim, self.q_win_size, self.update_rate]
         # Call the wrapped function
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),

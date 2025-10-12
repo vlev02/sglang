@@ -255,6 +255,8 @@ class ServerArgs:
     # KV cache comfression
     kv_cache_compression: Optional[str] = None
     ext_cache_dim: Optional[int] = 0
+    q_win_size: Optional[int] = 0
+    update_rate: Optional[float] = 0.5
     ext_cache_dtype: Optional[torch.dtype] = torch.float32
     radix_block_size: Optional[int] = None
     radix_compression_budget: Optional[float] = None
@@ -375,6 +377,7 @@ class ServerArgs:
 
         if self.kv_cache_compression is not None:
             self.ext_cache_dim = self.ext_cache_dim or 1
+            self.q_win_size = self.q_win_size or 64
             # assert self.radix_block_size > 1
             assert self.disable_overlap_schedule # TODO: enable overlap_schedule
             if self.radix_block_size:
@@ -748,6 +751,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.ext_cache_dim,
             help="Extended cache dimension for compression. Defaults to 0, automatically set to 1 when compression is enabled.",
+        )
+        parser.add_argument(
+            "--q-win-size",
+            type=int,
+            default=ServerArgs.q_win_size,
+            help="",
+        )
+        parser.add_argument(
+            "--update-rate",
+            type=float,
+            default=ServerArgs.update_rate,
+            help="Update rate parameter for KV cache compression.",
         )
         parser.add_argument(
             "--ext-cache-dtype",
