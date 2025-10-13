@@ -507,8 +507,8 @@ class RadixCache(BasePrefixCache):
         return total_prefix_length
 
     def _compress_node(
-        self, 
-        node: TreeNode, 
+        self,
+        node: TreeNode,
         budget: Optional[int | float] = None,
         residual_budget: Optional[int | float] = None,
         residual_clip: Optional[int] = None,
@@ -518,7 +518,11 @@ class RadixCache(BasePrefixCache):
         size = len(value)
         if size < 1:
             return
-        
+
+        # Safety check: kv_pool must exist for compression
+        if kv_pool is None:
+            return
+
         # Use configured budget if not provided
         if budget is None:
             budget = self.compression_budget
@@ -532,39 +536,64 @@ class RadixCache(BasePrefixCache):
             raise ValueError(f"Invalid budget value: {budget=}")
         elif budget < 1:
             budget = int(size * budget)
-        budget = min(max(1, budget), size)  # Ensure budget doesn't exceed available tokens
+        budget = int(min(max(1, budget), size))  # Ensure budget doesn't exceed available tokens
         
         # Validate and process residual budget
         if residual_budget < 0:
             raise ValueError(f"Invalid residual_budget value: {residual_budget=}")
         elif residual_budget < 1:
             residual_budget = int(budget * residual_budget)
-        residual_budget = max(0, min(residual_budget, budget))  # Ensure residual_budget is within bounds
+        else:
+            residual_budget = int(residual_budget)
+        residual_budget = int(max(0, min(residual_budget, budget)))  # Ensure residual_budget is within bounds
         
         if residual_budget > budget:
             raise ValueError(f"residual_budget ({residual_budget}) cannot exceed budget ({budget})")
         # top_k = budget - residual_budget
-        # return 
-    
+        # return
+
+        # Check if we have enough free memory for compression
+        # We need at least 'budget' free tokens to avoid OOM
+        available = self.token_to_kv_pool_allocator.available_size()
+        if available < budget:
+            # Not enough memory available for compression, skip it
+            return
+
         # alloc
         out_cache_loc = self.token_to_kv_pool_allocator.alloc(budget)
+        if out_cache_loc is None:
+            # Allocation failed (should not happen after the check above, but defensive)
+            return
         # out_cache_loc = torch.flip(out_cache_loc, dims=[0])
-        
-        # select
-        for layer_idx in range(kv_pool.layer_num):
-            _, topk_indices = torch.topk(kv_pool.s_buffer[layer_idx][value, :, 0], budget, dim=0)
-            # topk_indices = torch.arange(len(value), device=out_cache_loc.device)[..., None].expand(-1, kv_pool.k_buffer[layer_idx].size(1))
-            kv_pool.k_buffer[layer_idx][out_cache_loc] = torch.gather(kv_pool.k_buffer[layer_idx][value, ...], 0, topk_indices.unsqueeze(-1).expand(-1, -1, kv_pool.k_buffer[layer_idx].size(-1)))
-            kv_pool.v_buffer[layer_idx][out_cache_loc] = torch.gather(kv_pool.v_buffer[layer_idx][value, ...], 0, topk_indices.unsqueeze(-1).expand(-1, -1, kv_pool.v_buffer[layer_idx].size(-1)))
-            # kv_pool.k_buffer[layer_idx][out_cache_loc] = kv_pool.k_buffer[layer_idx][value, ...]
-            # kv_pool.v_buffer[layer_idx][out_cache_loc] = kv_pool.v_buffer[layer_idx][value, ...]
 
-            # Reset buffers: clear old locations and initialize new locations
-            kv_pool.s_buffer[layer_idx][value] = 0
-            kv_pool.w_buffer[layer_idx][value] = -2
+        # select - use gather to select top-k tokens per head
+        for layer_idx in range(kv_pool.layer_num):
+            # Calculate topk indices based on attention scores
+            # topk_indices has shape [budget, num_heads] - different tokens per head
+            _, topk_indices = torch.topk(kv_pool.s_buffer[layer_idx][value, :, 0], budget, dim=0)
+
+            # Prepare index tensor for gathering
+            # Note: expand() doesn't allocate memory, it's just a view
+            num_heads = kv_pool.k_buffer[layer_idx].size(1)
+            head_dim = kv_pool.k_buffer[layer_idx].size(2)
+            topk_idx_expanded = topk_indices.unsqueeze(-1).expand(-1, num_heads, head_dim)
+
+            # Gather selected KV values
+            kv_pool.k_buffer[layer_idx][out_cache_loc] = torch.gather(
+                kv_pool.k_buffer[layer_idx][value, ...], 0, topk_idx_expanded
+            )
+
+            # Same for V buffer (recompute expand for V in case it has different dim)
+            v_dim = kv_pool.v_buffer[layer_idx].size(2)
+            topk_idx_v = topk_indices.unsqueeze(-1).expand(-1, num_heads, v_dim)
+            kv_pool.v_buffer[layer_idx][out_cache_loc] = torch.gather(
+                kv_pool.v_buffer[layer_idx][value, ...], 0, topk_idx_v
+            )
+
+            # Initialize w_buffer for new locations (s_buffer remains 0 from allocation)
             kv_pool.w_buffer[layer_idx][out_cache_loc] = 0
 
-        # free
+        # free old values (s_buffer and w_buffer reset is handled in allocator.free())
         self.token_to_kv_pool_allocator.free(value)
         node.value = out_cache_loc
         return

@@ -136,6 +136,13 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+        # Reset s_buffer and w_buffer for compression if available
+        kv_pool = self._kvcache
+        if hasattr(kv_pool, 's_buffer') and kv_pool.s_buffer is not None:
+            for layer_idx in range(len(kv_pool.s_buffer)):
+                kv_pool.s_buffer[layer_idx][free_index] = 0
+                kv_pool.w_buffer[layer_idx][free_index] = -2
+
         if self.is_not_in_free_group:
             self.free_pages = torch.cat((self.free_pages, free_index))
         else:
@@ -508,6 +515,13 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+
+        # Reset s_buffer and w_buffer for compression if available
+        kv_pool = self._kvcache
+        if hasattr(kv_pool, 's_buffer') and kv_pool.s_buffer is not None:
+            for layer_idx in range(len(kv_pool.s_buffer)):
+                kv_pool.s_buffer[layer_idx][free_index] = 0
+                kv_pool.w_buffer[layer_idx][free_index] = -2
 
         if self.is_not_in_free_group:
             free_page_indices = torch.unique(free_index // self.page_size)
