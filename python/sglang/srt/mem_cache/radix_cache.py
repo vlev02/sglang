@@ -204,21 +204,21 @@ class NodeCompressor:
             raise ValueError(f"Invalid budget value: {budget=}")
         elif budget < 1:
             budget = int(size * budget)
-        processed_budget = min(max(1, budget), size)
+        processed_budget = int(min(max(1, budget), size))
 
         # Validate and process residual budget
         if residual_budget < 0:
             raise ValueError(f"Invalid residual_budget value: {residual_budget=}")
         elif residual_budget < 1:
             residual_budget = int(processed_budget * residual_budget)
-        processed_residual_budget = max(0, min(residual_budget, processed_budget))
+        processed_residual_budget = int(max(0, min(residual_budget, processed_budget)))
 
         if processed_residual_budget > processed_budget:
             raise ValueError(
                 f"residual_budget ({processed_residual_budget}) cannot exceed budget ({processed_budget})"
             )
 
-        top_budget = processed_budget - processed_residual_budget
+        top_budget = int(processed_budget - processed_residual_budget)
 
         # Calculate residual heap size
         if processed_residual_budget > 0:
