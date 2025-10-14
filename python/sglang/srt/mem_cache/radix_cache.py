@@ -132,20 +132,20 @@ class NodeCompressor:
     @classmethod
     def compress_node(
         cls,
-        node: TreeNode,
+        value: torch.Tensor,
         kv_pool: MHATokenToKVPool,
         token_allocator: BaseTokenToKVPoolAllocator,
         budget: int | float,
         residual_budget: int | float = 0,
         residual_clip: int = 0,
-    ):
-        """Compress a tree node's KV cache by selecting top-k tokens.
+    ) -> torch.Tensor:
+        """Compress KV cache by selecting top-k tokens.
 
-        This is the main entry point for node compression. It orchestrates
+        This is the main entry point for KV cache compression. It orchestrates
         the entire compression process for all layers.
 
         Args:
-            node: The tree node to compress
+            value: Cache locations tensor to compress
             kv_pool: The KV cache pool containing K, V, and score buffers
                 kv_pool.k_buffer[layer_id], kv_pool.v_buffer[layer_id] : tensor with shape(pool_size, head_num, head_dim)
                 kv_pool.s_buffer[layer_id], kv_pool.w_buffer[layer_id] :  tensor with shape(pool_size, head_num, 1)
@@ -153,8 +153,10 @@ class NodeCompressor:
             budget: Number or fraction of tokens to keep after compression
             residual_budget: Budget for residual tokens (default: 0)
             residual_clip: Maximum size for residual heap (default: 0)
+
+        Returns:
+            New compressed cache locations tensor
         """
-        value = node.value
         size = len(value)
 
         # Process and validate budget parameters
@@ -172,13 +174,12 @@ class NodeCompressor:
                 kv_pool=kv_pool,
                 value=value,
                 out_cache_loc=out_cache_loc,
-                top_budget=top_budget, 
-                residual_budget=residual_budget, 
+                top_budget=top_budget,
+                residual_budget=residual_budget,
                 residual_heap_size=residual_heap_size,
             )
 
-        # Finalize: free old cache and update node
-        cls.finalize(node, token_allocator, value, out_cache_loc)
+        return out_cache_loc
 
     @staticmethod
     def _process_budget_parameters(
@@ -337,30 +338,9 @@ class NodeCompressor:
         kv_pool.k_buffer[layer_idx][out_cache_loc[:actual_budget]] = combined_k
         kv_pool.v_buffer[layer_idx][out_cache_loc[:actual_budget]] = combined_v
 
-        # Reset buffers: clear old locations and initialize new locations
-        kv_pool.s_buffer[layer_idx][value] = 0
-        kv_pool.w_buffer[layer_idx][value] = -2
-        kv_pool.w_buffer[layer_idx][out_cache_loc[:actual_budget]] = 0
-
-    @staticmethod
-    def finalize(
-        node: TreeNode,
-        token_allocator: BaseTokenToKVPoolAllocator,
-        old_value: torch.Tensor,
-        new_value: torch.Tensor,
-    ):
-        """Finalize compression by freeing old cache and updating node.
-
-        Args:
-            node: The tree node to update
-            token_allocator: Allocator for freeing memory
-            old_value: Old cache locations to free
-            new_value: New cache locations to assign to node
-        """
-        # Free old cache locations
-        token_allocator.free(old_value)
-        # Update node value to point to new compressed cache
-        node.value = new_value
+        # Initialize buffers for new locations
+        kv_pool.w_buffer[layer_idx][out_cache_loc[:top_budget]] = 0
+        kv_pool.w_buffer[layer_idx][out_cache_loc[top_budget:]] = torch.log(torch.tensor(residual_heap_size, dtype=torch.float32))
 
 
 class RadixCache(BasePrefixCache):
@@ -778,15 +758,22 @@ class RadixCache(BasePrefixCache):
         if residual_clip is None:
             residual_clip = self.compression_residual_clip
 
+        # Save original value before compression
+        original_value = node.value
+
         # Call NodeCompressor classmethod to handle compression
-        NodeCompressor.compress_node(
-            node=node,
+        new_value = NodeCompressor.compress_node(
+            value=original_value,
             kv_pool=self.kv_pool,
             token_allocator=self.token_to_kv_pool_allocator,
             budget=budget,
             residual_budget=residual_budget,
             residual_clip=residual_clip,
         )
+
+        # Free the original value and update node
+        self.token_to_kv_pool_allocator.free(original_value)
+        node.value = new_value
         
         
     def _print_helper(self, node: TreeNode, indent: int):
