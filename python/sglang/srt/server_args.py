@@ -1853,6 +1853,20 @@ class ServerArgs:
         else:
             return f"http://{self.host}:{self.port}"
 
+    def client_url(self):
+        """Get the URL for HTTP clients to connect to.
+
+        Converts 0.0.0.0 (bind all interfaces) to 127.0.0.1 (localhost) for client connections.
+        Servers bind to 0.0.0.0 to accept connections on all network interfaces,
+        but HTTP clients must connect to a specific address like 127.0.0.1 or localhost.
+        """
+        if is_valid_ipv6_address(self.host):
+            return f"http://[{self.host}]:{self.port}"
+        else:
+            # Convert 0.0.0.0 to 127.0.0.1 for client connections
+            client_host = "127.0.0.1" if self.host == "0.0.0.0" else self.host
+            return f"http://{client_host}:{self.port}"
+
     def check_server_args(self):
         assert (
             self.tp_size * self.pp_size
