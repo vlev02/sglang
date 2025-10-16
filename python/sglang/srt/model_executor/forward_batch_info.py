@@ -189,6 +189,7 @@ class ForwardBatch:
     extend_seq_lens: Optional[torch.Tensor] = None
     extend_prefix_lens: Optional[torch.Tensor] = None
     evict_lens: Optional[torch.Tensor] = None
+    prefix_cache_lens: Optional[torch.Tensor] = None  # Actual KV cache length in radix tree (tree_idlen - evict_len)
     extend_start_loc: Optional[torch.Tensor] = None
     extend_prefix_lens_cpu: Optional[List[int]] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
@@ -379,6 +380,12 @@ class ForwardBatch:
             ret.evict_lens = torch.tensor(
                 batch.evict_lens, dtype=torch.int32 # TODO: need check
             ).to(device, non_blocking=True)
+            # In decode mode, prefix_cache_lens represents the actual KV cache length stored in radix tree
+            ret.prefix_cache_lens = torch.tensor(
+                batch.prefix_cache_lens, dtype=torch.int32
+            ).to(device, non_blocking=True)
+            # For backward compatibility
+            ret.prefix_lens = batch.seq_lens.clone()
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
@@ -390,6 +397,10 @@ class ForwardBatch:
             ).to(device, non_blocking=True)
             ret.evict_lens = torch.tensor(
                 batch.evict_lens, dtype=torch.int32
+            ).to(device, non_blocking=True)
+            # In extend mode, prefix_cache_lens represents the actual KV cache length stored in radix tree
+            ret.prefix_cache_lens = torch.tensor(
+                batch.prefix_cache_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
             ret.extend_num_tokens = batch.extend_num_tokens
             if support_triton(model_runner.server_args.attention_backend):

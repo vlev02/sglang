@@ -159,8 +159,8 @@ class FlashInferAttnBackend(AttentionBackend):
         if self.KV_compression:
             jit_args = [
                 self.KV_compression, # url,
-                ("s_cache", "w_cache", "ragged_indices"), # additional_tensor_names,
-                ("float", "float", "int64_t"), # additional_tensor_dtypes,
+                ("s_cache", "w_cache", "ragged_indices", "prefix_cache_lens"), # additional_tensor_names,
+                ("float", "float", "int64_t", "int64_t"), # additional_tensor_dtypes,
                 ("ext_dim", "q_win_size", "update_rate"), # additional_scalar_names,
                 ("int64_t", "int64_t", "double"), # additional_scalar_dtypes (PyTorch requires double for float scalars)
             ]
@@ -434,6 +434,8 @@ class FlashInferAttnBackend(AttentionBackend):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
         evict_lens: Optional[torch.Tensor] = None,
+        # prefix_lens: Optional[torch.Tensor] = None,
+        # prefix_cache_lens: Optional[torch.Tensor] = None,
     ):
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -501,7 +503,8 @@ class FlashInferAttnBackend(AttentionBackend):
             comp_args.append(
                 forward_batch.token_to_kv_pool.get_sw_buffer(layer.layer_id)
             )
-            comp_args += [cache_loc.contiguous(), self.ext_cache_dim, self.q_win_size, self.update_rate]
+            # Use prefix_cache_lens which already contains tree_idlen - evict_len
+            comp_args += [cache_loc.contiguous(), forward_batch.prefix_cache_lens, self.ext_cache_dim, self.q_win_size, self.update_rate]
         if not self.forward_metadata.use_ragged:
             raise NotImplementedError() # add by sean
             if k is not None:
@@ -591,7 +594,8 @@ class FlashInferAttnBackend(AttentionBackend):
             comp_args.append(
                 forward_batch.token_to_kv_pool.get_sw_buffer(layer.layer_id)
             )
-            comp_args += [cache_loc, self.ext_cache_dim, self.q_win_size, self.update_rate]
+            # Use prefix_cache_lens which already contains tree_idlen - evict_len
+            comp_args += [cache_loc.contiguous(), forward_batch.prefix_cache_lens, self.ext_cache_dim, self.q_win_size, self.update_rate]
         # Call the wrapped function
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),

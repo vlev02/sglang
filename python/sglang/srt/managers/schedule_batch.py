@@ -965,7 +965,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     @property
     def evict_lens(self,):
         return [r.evict_len for r in self.reqs]
-    
+
+    @property
+    def prefix_cache_lens(self,):
+        """Length of KV cache actually stored in radix tree (tree_idlen - evict_len)"""
+        return [r.tree_idxlen for r in self.reqs]
+
     def batch_size(self):
         return len(self.reqs)
 
@@ -1734,6 +1739,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
         evict_lens = self.evict_lens
+        prefix_cache_lens = self.prefix_cache_lens
 
         # Create seq_lens_cpu when needed
         if (
@@ -1785,6 +1791,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             evict_lens=evict_lens,
+            prefix_cache_lens=prefix_cache_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
             multimodal_inputs=self.multimodal_inputs,
             encoder_cached=self.encoder_cached,
@@ -1920,6 +1927,7 @@ class ModelWorkerBatch:
     extend_seq_lens: Optional[List[int]]
     extend_prefix_lens: Optional[List[int]]
     evict_lens: Optional[List[int]]
+    prefix_cache_lens: Optional[List[int]]  # tree_idlen - evict_len (actual KV cache length in radix tree)
     extend_logprob_start_lens: Optional[List[int]]
     extend_input_logprob_token_ids: Optional[torch.Tensor]
 

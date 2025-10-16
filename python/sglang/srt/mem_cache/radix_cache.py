@@ -701,6 +701,7 @@ class RadixCache(BasePrefixCache):
                 child_key = self.get_child_key_fn(key)
         value = value[-len(key):]
         while self.page_size > 1 and len(key): # paged node key
+            # len(key) >= (self.compression_tail_budget + self.page_size)
             child_key = self.get_child_key_fn(key)
             assert len(child_key) == self.page_size
             child_value = value[:self.page_size]
@@ -709,7 +710,6 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = child_key
             new_node.value = child_value
-            # new_node.value = child_value[:1] + child_value[2:]
             node.children[child_key] = new_node
             if len(new_node.key) >= self.compression_tail_budget:
                 self._compress_node(new_node)
