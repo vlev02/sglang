@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.node_compression import NodeCompressor
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -121,228 +122,6 @@ def _key_match_paged(key0: List, key1: List, page_size: int):
     return i
 
 
-class NodeCompressor:
-    """Handles compression of KV cache for tree nodes.
-
-    This class provides class methods for compressing KV cache stored in tree nodes
-    by selecting the most important tokens based on attention scores.
-    No instance creation is needed - all methods are class methods or static methods.
-    """
-
-    @classmethod
-    def compress_node(
-        cls,
-        value: torch.Tensor,
-        kv_pool: MHATokenToKVPool,
-        token_allocator: BaseTokenToKVPoolAllocator,
-        budget: int | float,
-        residual_budget: int | float = 0,
-        residual_clip: int = 0,
-    ) -> torch.Tensor:
-        """Compress KV cache by selecting top-k tokens.
-
-        This is the main entry point for KV cache compression. It orchestrates
-        the entire compression process for all layers.
-
-        Args:
-            value: Cache locations tensor to compress
-            kv_pool: The KV cache pool containing K, V, and score buffers
-                kv_pool.k_buffer[layer_id], kv_pool.v_buffer[layer_id] : tensor with shape(pool_size, head_num, head_dim)
-                kv_pool.s_buffer[layer_id], kv_pool.w_buffer[layer_id] :  tensor with shape(pool_size, head_num, 1)
-            token_allocator: Allocator for KV cache locations
-            budget: Number or fraction of tokens to keep after compression
-            residual_budget: Budget for residual tokens (default: 0)
-            residual_clip: Maximum size for residual heap (default: 0)
-
-        Returns:
-            New compressed cache locations tensor
-        """
-        size = len(value)
-
-        # Process and validate budget parameters
-        processed_budget, top_budget, residual_budget, residual_heap_size = cls._process_budget_parameters(
-            size, budget, residual_budget, residual_clip
-        )
-
-        # Allocate new cache locations
-        out_cache_loc = token_allocator.alloc(processed_budget)
-
-        # Compress each layer independently
-        for layer_idx in range(kv_pool.layer_num):
-            cls.compress_layer(
-                layer_idx=layer_idx,
-                kv_pool=kv_pool,
-                value=value,
-                out_cache_loc=out_cache_loc,
-                top_budget=top_budget,
-                residual_budget=residual_budget,
-                residual_heap_size=residual_heap_size,
-            )
-
-        return out_cache_loc
-
-    @staticmethod
-    def _process_budget_parameters(
-        size: int,
-        budget: int | float,
-        residual_budget: int | float,
-        residual_clip: int
-    ) -> tuple[int, int]:
-        """Validate and process budget parameters.
-
-        Args:
-            size: Size of the cache to compress
-            budget: Number or fraction of tokens to keep
-            residual_budget: Number or fraction for residual budget
-            residual_clip: Maximum size for residual heap
-
-        Returns:
-            Tuple of (processed_budget, residual_heap_size)
-        """
-        # Validate and process budget
-        if budget <= 0:
-            raise ValueError(f"Invalid budget value: {budget=}")
-        elif budget < 1:
-            budget = int(size * budget)
-        processed_budget = int(min(max(1, budget), size))
-
-        # Validate and process residual budget
-        if residual_budget < 0:
-            raise ValueError(f"Invalid residual_budget value: {residual_budget=}")
-        elif residual_budget < 1:
-            residual_budget = int(processed_budget * residual_budget)
-        processed_residual_budget = int(max(0, min(residual_budget, processed_budget)))
-
-        if processed_residual_budget > processed_budget:
-            raise ValueError(
-                f"residual_budget ({processed_residual_budget}) cannot exceed budget ({processed_budget})"
-            )
-
-        top_budget = int(processed_budget - processed_residual_budget)
-
-        # Calculate residual heap size
-        if processed_residual_budget > 0:
-            residual_heap_size = (size - top_budget) // processed_residual_budget
-            if residual_clip > 0:
-                residual_heap_size = min(residual_heap_size, residual_clip)
-        else:
-            residual_heap_size = 0
-
-        return processed_budget, top_budget, processed_residual_budget, residual_heap_size
-
-    @staticmethod
-    def compress_layer(
-        layer_idx: int,
-        kv_pool: MHATokenToKVPool,
-        value: torch.Tensor,
-        out_cache_loc: torch.Tensor,
-        top_budget: int,
-        residual_budget: int,
-        residual_heap_size: int,
-    ):
-        """Compress KV cache for a single layer using per-head two-part strategy.
-
-        This method implements a per-head two-part compression strategy:
-        1. Top-k selection: For each head, keep the top `top_budget` tokens by score
-        2. Residual compression: For each head, select top scoring remaining tokens and average into groups
-
-        Algorithm (per head):
-        - Sort tokens by importance scores for this head (descending)
-        - Select top `top_budget` tokens and keep them as-is
-        - From remaining tokens, select top `residual_budget * residual_heap_size` tokens by score
-        - Arrange selected residual tokens in their original order
-        - Split into `residual_budget` groups of `residual_heap_size` tokens each
-        - Average each group to create compressed residual tokens
-        - Combine top tokens + residual tokens into output
-
-        Args:
-            layer_idx: The index of the layer to compress
-            kv_pool: The KV cache pool
-            value: Original cache locations (shape: [N])
-            out_cache_loc: New cache locations (shape: [top_budget + residual_budget])
-            top_budget: Number of high-score tokens to keep directly per head
-            residual_budget: Number of compressed tokens from remaining tokens per head
-            residual_heap_size: Size of each group for averaging (tokens per residual)
-        """
-        N = len(value)
-        device = value.device
-
-        # Get scores for all tokens (shape: [N, head_num])
-        scores = kv_pool.s_buffer[layer_idx][value, :, 0]  # [N, head_num]
-        head_num = scores.shape[1]
-
-        # Get original K and V values
-        k_values = kv_pool.k_buffer[layer_idx][value, :, :]  # [N, head_num, head_dim]
-        v_values = kv_pool.v_buffer[layer_idx][value, :, :]  # [N, head_num, head_dim]
-
-        # Output buffers
-        combined_k = torch.zeros(top_budget + residual_budget, head_num, k_values.shape[2],
-                                 dtype=k_values.dtype, device=device)
-        combined_v = torch.zeros(top_budget + residual_budget, head_num, v_values.shape[2],
-                                 dtype=v_values.dtype, device=device)
-
-        # Process each head independently
-        for head_idx in range(head_num):
-            # Get scores for this head
-            head_scores = scores[:, head_idx]  # [N]
-
-            # Step 1: Select top tokens by score for this head
-            _, sorted_indices = torch.sort(head_scores, descending=True)  # [N]
-            top_indices = sorted_indices[:top_budget]  # [top_budget]
-
-            # Gather top K and V for this head
-            combined_k[:top_budget, head_idx, :] = k_values[top_indices, head_idx, :]
-            combined_v[:top_budget, head_idx, :] = v_values[top_indices, head_idx, :]
-
-            # Step 2: Handle residual tokens
-            if residual_budget > 0 and residual_heap_size > 0:
-                # Get remaining token indices (those not in top)
-                top_mask = torch.zeros(N, dtype=torch.bool, device=device)
-                top_mask[top_indices] = True
-                remaining_mask = ~top_mask
-
-                # Get scores of remaining tokens
-                remaining_scores = head_scores.clone()
-                remaining_scores[top_mask] = -float('inf')  # Mask out top tokens
-
-                # Select top residual_budget * residual_heap_size tokens from remaining by score
-                num_residual_source = residual_budget * residual_heap_size
-                if remaining_mask.sum() >= num_residual_source:
-                    # Get top scoring tokens from remaining
-                    _, residual_sorted_indices = torch.sort(remaining_scores, descending=True)
-                    residual_source_indices = residual_sorted_indices[:num_residual_source]  # [num_residual_source]
-
-                    # Sort these indices to maintain original order
-                    residual_source_indices, _ = torch.sort(residual_source_indices)
-
-                    # Reshape into groups: [residual_budget, residual_heap_size]
-                    residual_source_indices = residual_source_indices.reshape(residual_budget, residual_heap_size)
-
-                    # Get KV values for residual tokens for this head
-                    residual_k = k_values[residual_source_indices, head_idx, :]
-                    # Shape: [residual_budget, residual_heap_size, head_dim]
-                    residual_v = v_values[residual_source_indices, head_idx, :]
-                    # Shape: [residual_budget, residual_heap_size, head_dim]
-
-                    # Average each group: [residual_budget, head_dim]
-                    residual_k_compressed = residual_k.mean(dim=1)
-                    residual_v_compressed = residual_v.mean(dim=1)
-
-                    # Place into output
-                    combined_k[top_budget:top_budget + residual_budget, head_idx, :] = residual_k_compressed
-                    combined_v[top_budget:top_budget + residual_budget, head_idx, :] = residual_v_compressed
-
-        # Write to output locations
-        actual_budget = top_budget + residual_budget
-        assert out_cache_loc.size(-1) == actual_budget
-        kv_pool.k_buffer[layer_idx][out_cache_loc[:actual_budget]] = combined_k
-        kv_pool.v_buffer[layer_idx][out_cache_loc[:actual_budget]] = combined_v
-
-        # Initialize buffers for new locations
-        kv_pool.w_buffer[layer_idx][out_cache_loc[:top_budget]] = 0
-        kv_pool.w_buffer[layer_idx][out_cache_loc[top_budget:]] = torch.log(torch.tensor(residual_heap_size, dtype=torch.float32))
-
-
 class RadixCache(BasePrefixCache):
     def __init__(
         self,
@@ -393,6 +172,8 @@ class RadixCache(BasePrefixCache):
             self.key_match_fn = partial(_key_match_paged, page_size=page_size)
             self.get_child_key_fn = lambda key: tuple(key[:page_size])
         self.reset()
+        # compressor
+        self.compressor = NodeCompressor
 
     ##### Public API #####
 
@@ -762,7 +543,7 @@ class RadixCache(BasePrefixCache):
         original_value = node.value
 
         # Call NodeCompressor classmethod to handle compression
-        new_value = NodeCompressor.compress_node(
+        released_value, new_value = self.compressor.compress_node(
             value=original_value,
             kv_pool=self.kv_pool,
             token_allocator=self.token_to_kv_pool_allocator,
@@ -772,7 +553,8 @@ class RadixCache(BasePrefixCache):
         )
 
         # Free the original value and update node
-        self.token_to_kv_pool_allocator.free(original_value)
+        if released_value.size(-1) > 0:
+            self.token_to_kv_pool_allocator.free(released_value)
         node.value = new_value
         
         
