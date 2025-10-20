@@ -250,113 +250,18 @@ class VanillaNodeCompressor(BaseNodeCompressor):
             kv_pool.k_buffer[layer_idx][out_cache_loc[:actual_budget]] = combined_k[:actual_budget]
             kv_pool.v_buffer[layer_idx][out_cache_loc[:actual_budget]] = combined_v[:actual_budget]
 
-            # Update w_buffer
-            if top_budget > 0:
-                kv_pool.w_buffer[layer_idx][out_cache_loc[:top_budget]] = 0
-            if residual_budget > 0 and residual_heap_size > 0:
-                log_heap_size = torch.log(torch.tensor(residual_heap_size, dtype=torch.float32, device=device))
-                kv_pool.w_buffer[layer_idx][out_cache_loc[top_budget:actual_budget]] = log_heap_size
+            # Update w_buffer (weight buffer for tracking compression history)
+            # w_buffer stores log(heap_size) for each token to track compression level:
+            # - Top tokens get 0 (not compressed, original tokens)
+            # - Residual tokens get log(heap_size) (compressed from heap_size tokens)
+            # This information is used during attention to adjust attention scores
+            # if top_budget > 0:
+            #     kv_pool.w_buffer[layer_idx][out_cache_loc[:top_budget]] = 0
+            # if residual_budget > 0 and residual_heap_size > 0:
+            #     log_heap_size = torch.log(torch.tensor(residual_heap_size, dtype=torch.float32, device=device))
+            #     kv_pool.w_buffer[layer_idx][out_cache_loc[top_budget:actual_budget]] = log_heap_size
 
 class OptimizedNodeCompressor(BaseNodeCompressor):
-
-    @staticmethod
-    def compress_layer(
-        layer_idx: int,
-        kv_pool: "MHATokenToKVPool",
-        value: torch.Tensor,
-        out_cache_loc: torch.Tensor,
-        top_budget: int,
-        residual_budget: int,
-        residual_heap_size: int,
-    ) -> None:
-        N = value.shape[0]
-        device = value.device
-
-        s_buffer = kv_pool.s_buffer[layer_idx]
-        k_buffer = kv_pool.k_buffer[layer_idx]
-        v_buffer = kv_pool.v_buffer[layer_idx]
-        head_num = s_buffer.shape[1]
-
-        # Sort scores for all heads at once
-        scores = s_buffer[value, :, 0]  # [N, head_num]
-        _, sorted_indices = torch.sort(scores, dim=0, descending=True)  # [N, head_num]
-
-        actual_budget = top_budget + residual_budget
-
-        # === VECTORIZED and MEMORY-EFFICIENT: Process ALL heads simultaneously ===
-        head_indices = torch.arange(head_num, device=device)
-
-        # --- Top tokens ---
-        if top_budget > 0:
-            # Get the top indices relative to the `value` tensor
-            top_indices_relative = sorted_indices[:top_budget, :]  # [top_budget, head_num]
-            # Get the final source locations from the main buffer
-            final_top_locs = value[top_indices_relative]  # [top_budget, head_num]
-
-            # Create head indices for broadcasting
-            head_range = head_indices[None, :]  # [1, head_num]
-            head_range_expanded = head_range.expand(top_budget, -1)
-
-            # Define destination locations
-            out_loc_range = out_cache_loc[:top_budget, None]  # [top_budget, 1]
-
-            # Perform a direct gather-scatter from the main buffer to the output locations
-            k_buffer[out_loc_range, head_range_expanded, :] = k_buffer[final_top_locs, head_range_expanded, :]
-            v_buffer[out_loc_range, head_range_expanded, :] = v_buffer[final_top_locs, head_range_expanded, :]
-
-        # --- Residual tokens ---
-        if residual_budget > 0 and residual_heap_size > 0:
-            num_residual_source = residual_budget * residual_heap_size
-            if N - top_budget >= num_residual_source:
-                # Get residual indices relative to the `value` tensor: [num_residual_source, head_num]
-                residual_indices_relative = sorted_indices[top_budget:top_budget + num_residual_source, :]
-                # Sort for memory locality
-                residual_indices_relative, _ = torch.sort(residual_indices_relative, dim=0)
-                # Reshape to [residual_budget, residual_heap_size, head_num]
-                residual_indices_relative = residual_indices_relative.reshape(residual_budget, residual_heap_size, head_num)
-
-                # Get final source locations from the main buffer
-                final_residual_locs = value[residual_indices_relative]  # [residual_budget, heap_size, head_num]
-
-                # Create head indices for broadcasting
-                head_range_res = head_indices[None, None, :]  # [1, 1, head_num]
-                head_expanded = head_range_res.expand(residual_budget, residual_heap_size, -1)
-
-                # Gather directly from main buffer: [residual_budget, heap_size, head_num, head_dim]
-                residual_k = k_buffer[final_residual_locs, head_expanded, :]
-                residual_v = v_buffer[final_residual_locs, head_expanded, :]
-
-                # Average over heap dimension: [residual_budget, head_num, head_dim]
-                k_residual = residual_k.mean(dim=1)
-                v_residual = residual_v.sum(dim=1)
-
-                # Scatter to output locations
-                out_loc_res = out_cache_loc[top_budget:actual_budget, None]  # [residual_budget, 1]
-                head_range_scatter = head_indices[None, :].expand(residual_budget, -1)
-                k_buffer[out_loc_res, head_range_scatter, :] = k_residual
-                v_buffer[out_loc_res, head_range_scatter, :] = v_residual
-
-        # Update w_buffer
-        if actual_budget > 0:
-            if top_budget > 0:
-                kv_pool.w_buffer[layer_idx][out_cache_loc[:top_budget]] = 0
-            if residual_budget > 0 and residual_heap_size > 0:
-                log_heap_size = torch.log(torch.tensor(residual_heap_size, dtype=torch.float32, device=device))
-                kv_pool.w_buffer[layer_idx][out_cache_loc[top_budget:actual_budget]] = log_heap_size
-
-
-# Default compressor to use
-NodeCompressor = OptimizedNodeCompressor
-
-class UltraOptimizedNodeCompressor(BaseNodeCompressor):
-    """
-    Ultra-optimized implementation matching OptimizedNodeCompressor behavior.
-
-    This implementation is identical to OptimizedNodeCompressor but serves as a
-    template for future optimizations. Currently validates correctness.
-
-    Performance: Equivalent to OptimizedNodeCompressor
-    """
 
     @staticmethod
     def compress_layer(
@@ -423,17 +328,34 @@ class UltraOptimizedNodeCompressor(BaseNodeCompressor):
                 k_buffer[out_loc_res, head_range_scatter, :] = k_residual
                 v_buffer[out_loc_res, head_range_scatter, :] = v_residual
 
-        # Update w_buffer - same as OptimizedNodeCompressor (broadcasting handles shape)
-        if actual_budget > 0:
-            if top_budget > 0:
-                kv_pool.w_buffer[layer_idx][out_cache_loc[:top_budget]] = 0
-            if residual_budget > 0 and residual_heap_size > 0:
-                log_heap_size = torch.log(torch.tensor(residual_heap_size, dtype=torch.float32, device=device))
-                kv_pool.w_buffer[layer_idx][out_cache_loc[top_budget:actual_budget]] = log_heap_size
+        # Update w_buffer (weight buffer for tracking compression history)
+        # w_buffer shape: [pool_size, head_num, 1], stores compression weight per token
+        # Purpose: Track how many original tokens each compressed token represents
+        # - Top tokens: w=0 → represents 1 original token (no compression)
+        # - Residual tokens: w=log(heap_size) → represents heap_size original tokens (averaged)
+        # Usage: During attention, weights adjust scores to account for compression ratio
+        # if actual_budget > 0:
+        #     if top_budget > 0:
+        #         kv_pool.w_buffer[layer_idx][out_cache_loc[:top_budget]] = 0
+        #     if residual_budget > 0 and residual_heap_size > 0:
+        #         log_heap_size = torch.log(torch.tensor(residual_heap_size, dtype=torch.float32, device=device))
+        #         kv_pool.w_buffer[layer_idx][out_cache_loc[top_budget:actual_budget]] = log_heap_size
+
+
+
+
+from .node_compression_triton import TritonNodeCompressor
+class UltraOptimizedNodeCompressor(TritonNodeCompressor):
+    pass
+
+
+# Default compressor to use
+NodeCompressor = UltraOptimizedNodeCompressor
 
 __all__ = [
     "BaseNodeCompressor",
     "VanillaNodeCompressor",
     "OptimizedNodeCompressor",
+    "UltraOptimizedNodeCompressor",
     "NodeCompressor",
 ]
