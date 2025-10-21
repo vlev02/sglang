@@ -178,6 +178,13 @@ class TritonNodeCompressor(BaseNodeCompressor):
         residual_budget: int,
         residual_heap_size: int,
     ) -> None:
+        # Safety check for None out_cache_loc (allocation failure)
+        if out_cache_loc is None:
+            raise RuntimeError(
+                "out_cache_loc is None - allocation failed. "
+                "This should have been caught in compress_node()."
+            )
+
         N = value.shape[0]
         device = value.device
 
@@ -189,46 +196,90 @@ class TritonNodeCompressor(BaseNodeCompressor):
 
         # Sort scores for all heads at once
         scores = s_buffer[value, :, 0]  # [N, head_num]
-        _, sorted_indices = torch.sort(scores, dim=0, descending=True)
 
+        # CRITICAL FIX: Use topk instead of sort when possible (much less memory)
         actual_budget = top_budget + residual_budget
+        num_needed = top_budget + (residual_budget * residual_heap_size if residual_budget > 0 else 0)
+
+        # Pre-allocate head_indices once
         head_indices = torch.arange(head_num, device=device)
 
         # --- Top tokens: Use Triton fused kernel ---
         if top_budget > 0:
-            top_indices_relative = sorted_indices[:top_budget, :]
-            final_top_locs = value[top_indices_relative]
+            # OPTIMIZATION: Use topk per head instead of full sort
+            top_locs_buffer = torch.empty((top_budget, head_num), dtype=torch.long, device=device)
+
+            for h in range(head_num):
+                # topk is much faster and uses less memory than sort
+                _, top_k_indices = torch.topk(scores[:, h], k=min(top_budget, N), largest=True, sorted=False)
+                top_locs_buffer[:min(top_budget, N), h] = value[top_k_indices]
+
             out_locs_top = out_cache_loc[:top_budget]
 
             grid = (top_budget, head_num)
             fused_top_token_copy_kernel[grid](
                 k_buffer, v_buffer,
-                final_top_locs, out_locs_top,
+                top_locs_buffer, out_locs_top,
                 head_dim=head_dim,
                 k_stride_loc=k_buffer.stride(0), k_stride_head=k_buffer.stride(1),
                 v_stride_loc=v_buffer.stride(0), v_stride_head=v_buffer.stride(1),
-                in_locs_stride_token=final_top_locs.stride(0), in_locs_stride_head=final_top_locs.stride(1),
+                in_locs_stride_token=top_locs_buffer.stride(0), in_locs_stride_head=top_locs_buffer.stride(1),
             )
+
+            # CRITICAL: Synchronize before cleanup to avoid use-after-free
+            torch.cuda.synchronize()
+            del top_locs_buffer, out_locs_top
 
         # --- Residual tokens: Use Triton fused kernel ---
         if residual_budget > 0 and residual_heap_size > 0:
             num_residual_source = residual_budget * residual_heap_size
             if N - top_budget >= num_residual_source:
-                # Prepare indices
-                residual_indices_relative = sorted_indices[top_budget:top_budget + num_residual_source, :]
-                residual_indices_relative, _ = torch.sort(residual_indices_relative, dim=0)
-                residual_indices_relative = residual_indices_relative.reshape(residual_budget, residual_heap_size, head_num)
+                # OPTIMIZATION: Pre-allocate buffer to avoid multiple allocations
+                residual_locs_buffer = torch.empty(
+                    (residual_budget, residual_heap_size, head_num),
+                    dtype=torch.long,
+                    device=device
+                )
 
-                # Convert to absolute source locations
-                final_residual_locs = value[residual_indices_relative]  # [residual_budget, heap_size, head_num]
+                # Process per head to minimize memory
+                for h in range(head_num):
+                    # Get top-k+residuals for this head (need sorted for grouping)
+                    num_select = min(top_budget + num_residual_source, N)
+                    _, indices_h = torch.topk(scores[:, h], k=num_select, largest=True, sorted=True)
 
-                # Flatten for kernel: [residual_budget * heap_size * head_num]
-                source_locs_flat = final_residual_locs.reshape(-1).contiguous()
+                    if len(indices_h) > top_budget:
+                        # Extract residual indices
+                        res_idx = indices_h[top_budget:min(top_budget + num_residual_source, len(indices_h))]
 
-                # Output locations for residual tokens
-                out_locs_residual = out_cache_loc[top_budget:actual_budget].contiguous()
+                        # OPTIMIZATION: Sort only residuals, not all indices
+                        res_idx_sorted, _ = torch.sort(res_idx)
 
-                # Launch Triton kernel: one program per (residual_idx, head_idx)
+                        # Reshape and store
+                        if len(res_idx_sorted) >= num_residual_source:
+                            res_heaps = res_idx_sorted[:num_residual_source].reshape(residual_budget, residual_heap_size)
+                            residual_locs_buffer[:, :, h] = value[res_heaps]
+                            del res_heaps
+
+                        del res_idx, res_idx_sorted
+
+                    del indices_h
+
+                # OPTIMIZATION: Check if contiguous before calling .contiguous()
+                if residual_locs_buffer.is_contiguous():
+                    source_locs_flat = residual_locs_buffer.view(-1)
+                else:
+                    source_locs_flat = residual_locs_buffer.reshape(-1).contiguous()
+
+                del residual_locs_buffer  # Free immediately
+
+                # OPTIMIZATION: Avoid unnecessary contiguous() copy
+                out_slice = out_cache_loc[top_budget:actual_budget]
+                if out_slice.is_contiguous():
+                    out_locs_residual = out_slice
+                else:
+                    out_locs_residual = out_slice.contiguous()
+
+                # Launch Triton kernel
                 grid = (residual_budget, head_num)
                 fused_residual_gather_reduce_scatter_kernel[grid](
                     k_buffer, v_buffer,
@@ -242,6 +293,19 @@ class TritonNodeCompressor(BaseNodeCompressor):
                     v_stride_loc=v_buffer.stride(0),
                     v_stride_head=v_buffer.stride(1),
                 )
+
+                # CRITICAL: Synchronize before cleanup
+                torch.cuda.synchronize()
+                del source_locs_flat, out_locs_residual, out_slice
+
+        # Final cleanup
+        del scores, head_indices
+
+        # OPTIMIZATION: More aggressive cache cleanup (every 2 layers instead of 4)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()  # Ensure all kernels complete
+            if layer_idx % 2 == 1:  # Every 2 layers
+                torch.cuda.empty_cache()
 
 
 __all__ = [

@@ -60,21 +60,33 @@ class BaseNodeCompressor(ABC):
         """
         size = len(value)
         if size == 0:
-            return value, torch.empty(0, dtype=value.dtype, device=value.device)
+            return torch.empty(0, dtype=value.dtype, device=value.device), value
 
         processed_budget, top_budget, processed_residual_budget, residual_heap_size = cls._process_budget_parameters(
             size, budget, residual_budget, residual_clip
         )
 
         if processed_budget == 0:
-            return value, torch.empty(0, dtype=value.dtype, device=value.device)
+            return torch.empty(0, dtype=value.dtype, device=value.device), value
 
         # If no compression needed, return original
         if processed_budget >= size:
-            return value, value
+            return torch.empty(0, dtype=value.dtype, device=value.device), value
 
         # Allocate new cache locations for compressed tokens
         out_cache_loc = token_allocator.alloc(processed_budget)
+
+        # Handle allocation failure - return original value without compression
+        if out_cache_loc is None:
+            import warnings
+            warnings.warn(
+                f"Failed to allocate {processed_budget} cache locations for compression. "
+                f"Returning uncompressed value of size {size}. "
+                f"This may indicate KV cache exhaustion.",
+                RuntimeWarning,
+                stacklevel=2
+            )
+            return torch.empty(0, dtype=value.dtype, device=value.device), value
 
         # Compress each layer
         for layer_idx in range(kv_pool.layer_num):
@@ -262,6 +274,12 @@ class VanillaNodeCompressor(BaseNodeCompressor):
             #     kv_pool.w_buffer[layer_idx][out_cache_loc[top_budget:actual_budget]] = log_heap_size
 
 class OptimizedNodeCompressor(BaseNodeCompressor):
+    """
+    Optimized node compressor with explicit memory cleanup.
+
+    This version adds explicit deletion of intermediate tensors to prevent
+    memory accumulation during frequent compressions.
+    """
 
     @staticmethod
     def compress_layer(
@@ -303,6 +321,9 @@ class OptimizedNodeCompressor(BaseNodeCompressor):
             k_buffer[out_loc_range, head_range_expanded, :] = k_buffer[final_top_locs, head_range_expanded, :]
             v_buffer[out_loc_range, head_range_expanded, :] = v_buffer[final_top_locs, head_range_expanded, :]
 
+            # Clean up top token intermediate tensors
+            del top_indices_relative, final_top_locs, head_range_expanded, out_loc_range
+
         # --- Residual tokens ---
         if residual_budget > 0 and residual_heap_size > 0:
             num_residual_source = residual_budget * residual_heap_size
@@ -328,6 +349,18 @@ class OptimizedNodeCompressor(BaseNodeCompressor):
                 k_buffer[out_loc_res, head_range_scatter, :] = k_residual
                 v_buffer[out_loc_res, head_range_scatter, :] = v_residual
 
+                # Clean up residual intermediate tensors
+                del residual_indices_relative, final_residual_locs, head_expanded
+                del residual_k, residual_v, k_residual, v_residual
+                del out_loc_res, head_range_scatter
+
+        # Clean up shared tensors
+        del scores, sorted_indices, head_indices
+
+        # Force GPU memory cleanup periodically
+        if device.type == 'cuda' and layer_idx % 4 == 3:  # Every 4th layer
+            torch.cuda.empty_cache()
+
         # Update w_buffer (weight buffer for tracking compression history)
         # w_buffer shape: [pool_size, head_num, 1], stores compression weight per token
         # Purpose: Track how many original tokens each compressed token represents
@@ -345,7 +378,8 @@ class OptimizedNodeCompressor(BaseNodeCompressor):
 
 
 from .node_compression_triton import TritonNodeCompressor
-class UltraOptimizedNodeCompressor(TritonNodeCompressor):
+from .node_compression_triton_v2 import UltraOptimizedTritonCompressor
+class UltraOptimizedNodeCompressor(UltraOptimizedTritonCompressor):
     pass
 
 
