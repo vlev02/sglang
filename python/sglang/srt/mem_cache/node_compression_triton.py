@@ -168,8 +168,8 @@ class TritonNodeCompressor(BaseNodeCompressor):
     Requirements: triton library installed
     """
 
-    @staticmethod
     def compress_layer(
+        self,
         layer_idx: int,
         kv_pool: "MHATokenToKVPool",
         value: torch.Tensor,

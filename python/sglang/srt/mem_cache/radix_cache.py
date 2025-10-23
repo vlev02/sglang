@@ -172,8 +172,28 @@ class RadixCache(BasePrefixCache):
             self.key_match_fn = partial(_key_match_paged, page_size=page_size)
             self.get_child_key_fn = lambda key: tuple(key[:page_size])
         self.reset()
-        # compressor
-        self.compressor = NodeCompressor
+        # compressor - instantiate with budget configuration
+        if self.compression_budget is not None:
+            # Prepare compressor arguments
+            compressor_kwargs = {
+                "budget": self.compression_budget,
+                "page_size": self.page_size,
+                "residual_budget": self.compression_residual_budget,
+                "residual_clip": self.compression_residual_clip,
+            }
+
+            # Add optional parameters if kv_pool is available (for PreallocatingNodeCompressor)
+            if self.kv_pool is not None:
+                compressor_kwargs.update({
+                    "head_num": self.kv_pool.head_num,
+                    "head_dim": self.kv_pool.head_dim,
+                    "dtype": self.kv_pool.dtype,
+                    "device": self.device,
+                })
+
+            self.compressor = NodeCompressor(**compressor_kwargs)
+        else:
+            self.compressor = None
 
     ##### Public API #####
 
@@ -492,7 +512,7 @@ class RadixCache(BasePrefixCache):
             new_node.key = child_key
             new_node.value = child_value
             node.children[child_key] = new_node
-            if len(new_node.key) >= self.compression_tail_budget:
+            if len(key) >= self.compression_tail_budget:
                 self._compress_node(new_node)
             self.evictable_size_ += len(new_node.value)
             self._record_store_event(new_node)
@@ -512,50 +532,47 @@ class RadixCache(BasePrefixCache):
     def _compress_node(
         self,
         node: TreeNode,
-        budget: Optional[int | float] = None,
-        residual_budget: Optional[int | float] = None,
-        residual_clip: Optional[int] = None,
         ):
         """Compress a tree node's KV cache by selecting top-k tokens.
 
-        This method uses the NodeCompressor class methods to handle the compression logic.
+        This method uses the NodeCompressor instance to handle the compression logic.
         It processes each layer independently to reduce memory footprint.
 
         Args:
             node: The tree node to compress
-            budget: Number or fraction of tokens to keep (uses self.compression_budget if None)
-            residual_budget: Budget for residual tokens (uses self.compression_residual_budget if None)
-            residual_clip: Maximum size for residual heap (uses self.compression_residual_clip if None)
         """
-        # Early exit if node is empty
-        if len(node.value) < 1:
+        # Early exit if node is empty or compressor is not configured
+        if len(node.value) < 1 or self.compressor is None:
             return
-
-        # Use configured budget if not provided
-        if budget is None:
-            budget = self.compression_budget
-        if residual_budget is None:
-            residual_budget = self.compression_residual_budget
-        if residual_clip is None:
-            residual_clip = self.compression_residual_clip
 
         # Save original value before compression
         original_value = node.value
 
-        # Call NodeCompressor classmethod to handle compression
-        released_value, new_value = self.compressor.compress_node(
-            value=original_value,
-            kv_pool=self.kv_pool,
-            token_allocator=self.token_to_kv_pool_allocator,
-            budget=budget,
-            residual_budget=residual_budget,
-            residual_clip=residual_clip,
-        )
+        # Allocate new cache locations for compressed tokens
+        # The compressor will use these to store compressed KV cache
+        out_cache_loc = self.token_to_kv_pool_allocator.alloc(self.compressor.processed_budget)
 
-        # Free the original value and update node
-        if released_value.size(-1) > 0:
-            self.token_to_kv_pool_allocator.free(released_value)
-        node.value = new_value
+        # Handle allocation failure
+        if self.compressor.processed_budget > 0 and out_cache_loc is None:
+            import warnings
+            warnings.warn(
+                f"Failed to allocate {self.compressor.processed_budget} cache locations for compression. "
+                f"Skipping compression for this node.",
+                RuntimeWarning,
+                stacklevel=2
+            )
+        else:
+            # Call NodeCompressor instance method to handle compression
+            released_value, new_value = self.compressor.compress_node(
+                value=original_value,
+                kv_pool=self.kv_pool,
+                out_cache_loc=out_cache_loc,
+            )
+            node.value = new_value
+            # Free the released indices and update node with new compressed indices
+            if released_value.size(-1) > 0:
+                self.token_to_kv_pool_allocator.free(released_value)
+        
         
         
     def _print_helper(self, node: TreeNode, indent: int):

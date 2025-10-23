@@ -35,8 +35,8 @@ class UltraOptimizedTritonCompressor(BaseNodeCompressor):
     4. More aggressive memory management
     """
 
-    @staticmethod
     def compress_layer(
+        self,
         layer_idx: int,
         kv_pool: "MHATokenToKVPool",
         value: torch.Tensor,

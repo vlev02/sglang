@@ -28,18 +28,109 @@ class BaseNodeCompressor(ABC):
     All compression implementations must provide:
     1. compress_node: Main entry point for compressing a node
     2. compress_layer: Layer-specific compression logic
-    3. _process_budget_parameters: Budget parameter validation and processing
     """
 
-    @classmethod
-    def compress_node(
-        cls,
-        value: torch.Tensor,
-        kv_pool: "MHATokenToKVPool",
-        token_allocator: "BaseTokenToKVPoolAllocator",
+    def __init__(
+        self,
         budget: int | float,
+        page_size: int,
         residual_budget: int | float = 0,
         residual_clip: int = 0,
+        head_num: int = None,
+        head_dim: int = None,
+        dtype: torch.dtype = None,
+        device: torch.device = None,
+        **kwargs  # Accept any additional arguments for subclass flexibility
+    ):
+        """
+        Initialize the compressor with budget configuration.
+
+        Args:
+            budget: Number or fraction (0-1) of tokens to keep after compression
+            page_size: Expected size of input value tensor (from radix tree's page_size)
+            residual_budget: Number or fraction of budget for residual tokens (default: 0)
+            residual_clip: Maximum heap size for residual averaging (default: 0)
+            head_num: Number of attention heads (optional, for PreallocatingNodeCompressor)
+            head_dim: Dimension of each attention head (optional, for PreallocatingNodeCompressor)
+            dtype: Data type of KV cache (optional, for PreallocatingNodeCompressor)
+            device: Device where cache resides (optional, for PreallocatingNodeCompressor)
+            **kwargs: Additional arguments for subclass flexibility
+
+        Raises:
+            ValueError: If budget parameters are invalid
+        """
+        if budget <= 0:
+            raise ValueError(f"Invalid budget value: {budget=}")
+        if page_size <= 0:
+            raise ValueError(f"Invalid page_size value: {page_size=}")
+        if residual_budget < 0:
+            raise ValueError(f"Invalid residual_budget value: {residual_budget=}")
+        if residual_clip < 0:
+            raise ValueError(f"Invalid residual_clip value: {residual_clip=}")
+
+        self.page_size = page_size
+
+        # Store optional parameters for subclasses like PreallocatingNodeCompressor
+        self.head_num = head_num
+        self.head_dim = head_dim
+        self.dtype = dtype
+        self.device = device
+
+        # Process and store final budget parameters
+        # This is done once at initialization instead of on every compress_node call
+        size = page_size  # Input size is always page_size
+
+        # Convert budget to absolute value
+        if budget < 1:  # Fraction mode
+            budget = int(size * budget)
+        self.processed_budget = int(min(max(1, budget), size))
+
+        # Convert residual_budget to absolute value
+        if residual_budget < 1:  # Fraction mode
+            residual_budget = int(self.processed_budget * residual_budget)
+        self.processed_residual_budget = int(max(0, min(residual_budget, self.processed_budget)))
+
+        if self.processed_residual_budget > self.processed_budget:
+            raise ValueError(
+                f"residual_budget ({self.processed_residual_budget}) cannot exceed budget ({self.processed_budget})"
+            )
+
+        self.top_budget = int(self.processed_budget - self.processed_residual_budget)
+
+        # Calculate residual_heap_size
+        if self.processed_residual_budget > 0:
+            available_for_residual = size - self.top_budget
+            if available_for_residual <= 0:
+                self.residual_heap_size = 0
+                self.processed_residual_budget = 0  # Cannot form any groups
+            else:
+                self.residual_heap_size = available_for_residual // self.processed_residual_budget
+                if residual_clip > 0:
+                    self.residual_heap_size = min(self.residual_heap_size, residual_clip)
+        else:
+            self.residual_heap_size = 0
+
+        # Final alignment check
+        if self.top_budget + self.processed_residual_budget != self.processed_budget:
+            self.top_budget = self.processed_budget - self.processed_residual_budget
+
+        # Log compression configuration
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(
+            f"Initialized {self.__class__.__name__} with compression config: "
+            f"page_size={self.page_size}, "
+            f"processed_budget={self.processed_budget}, "
+            f"top_budget={self.top_budget}, "
+            f"residual_budget={self.processed_residual_budget}, "
+            f"residual_heap_size={self.residual_heap_size}"
+        )
+
+    def compress_node(
+        self,
+        value: torch.Tensor,
+        kv_pool: "MHATokenToKVPool",
+        out_cache_loc: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compress KV cache by selecting top-k tokens based on attention scores.
@@ -47,42 +138,41 @@ class BaseNodeCompressor(ABC):
         Args:
             value: Cache locations tensor [N] containing token positions to compress
             kv_pool: The KV cache pool containing k_buffer, v_buffer, s_buffer, w_buffer
-            token_allocator: Allocator for new KV cache locations
-            budget: Number or fraction (0-1) of tokens to keep after compression
-            residual_budget: Number or fraction of budget for residual tokens (default: 0)
-            residual_clip: Maximum heap size for residual averaging (default: 0)
+            out_cache_loc: Pre-allocated cache locations [processed_budget] for compressed tokens
+                          (allocated by caller, e.g., RadixCache)
 
         Returns:
             Tuple of (original value tensor, new compressed cache locations tensor)
 
         Raises:
-            ValueError: If budget parameters are invalid
+            ValueError: If input value length doesn't match expected page_size
         """
         size = len(value)
         if size == 0:
             return torch.empty(0, dtype=value.dtype, device=value.device), value
 
-        processed_budget, top_budget, processed_residual_budget, residual_heap_size = cls._process_budget_parameters(
-            size, budget, residual_budget, residual_clip
-        )
+        # Validate input length matches expected page_size
+        if size != self.page_size:
+            raise ValueError(
+                f"Input value length ({size}) does not match expected page_size ({self.page_size}). "
+                f"All nodes should have exactly page_size tokens."
+            )
 
-        if processed_budget == 0:
+        # Use precomputed budget parameters (calculated once in __init__)
+        if self.processed_budget == 0:
             return torch.empty(0, dtype=value.dtype, device=value.device), value
 
         # If no compression needed, return original
-        if processed_budget >= size:
+        if self.processed_budget >= size:
             return torch.empty(0, dtype=value.dtype, device=value.device), value
 
-        # Allocate new cache locations for compressed tokens
-        out_cache_loc = token_allocator.alloc(processed_budget)
-
-        # Handle allocation failure - return original value without compression
-        if out_cache_loc is None:
+        # Validate that out_cache_loc was provided and has correct size
+        if out_cache_loc is None or len(out_cache_loc) < self.processed_budget:
             import warnings
             warnings.warn(
-                f"Failed to allocate {processed_budget} cache locations for compression. "
-                f"Returning uncompressed value of size {size}. "
-                f"This may indicate KV cache exhaustion.",
+                f"Invalid out_cache_loc: expected {self.processed_budget} locations, "
+                f"got {len(out_cache_loc) if out_cache_loc is not None else 'None'}. "
+                f"Returning uncompressed value.",
                 RuntimeWarning,
                 stacklevel=2
             )
@@ -90,21 +180,21 @@ class BaseNodeCompressor(ABC):
 
         # Compress each layer
         for layer_idx in range(kv_pool.layer_num):
-            cls.compress_layer(
+            self.compress_layer(
                 layer_idx=layer_idx,
                 kv_pool=kv_pool,
                 value=value,
                 out_cache_loc=out_cache_loc,
-                top_budget=top_budget,
-                residual_budget=processed_residual_budget,
-                residual_heap_size=residual_heap_size,
+                top_budget=self.top_budget,
+                residual_budget=self.processed_residual_budget,
+                residual_heap_size=self.residual_heap_size,
             )
 
         return value, out_cache_loc
 
-    @staticmethod
     @abstractmethod
     def compress_layer(
+        self,
         layer_idx: int,
         kv_pool: "MHATokenToKVPool",
         value: torch.Tensor,
@@ -130,68 +220,6 @@ class BaseNodeCompressor(ABC):
         """
         pass
 
-    @staticmethod
-    def _process_budget_parameters(
-        size: int,
-        budget: int | float,
-        residual_budget: int | float,
-        residual_clip: int,
-    ) -> Tuple[int, int, int, int]:
-        """
-        Validate and process budget parameters.
-
-        Args:
-            size: Total number of tokens to compress
-            budget: Target budget (absolute count or fraction)
-            residual_budget: Residual budget (absolute count or fraction of budget)
-            residual_clip: Maximum residual heap size
-
-        Returns:
-            Tuple of (processed_budget, top_budget, processed_residual_budget, residual_heap_size)
-
-        Raises:
-            ValueError: If budget parameters are invalid
-        """
-        # Validate and convert budget
-        if budget <= 0:
-            raise ValueError(f"Invalid budget value: {budget=}")
-        elif budget < 1:  # Fraction mode
-            budget = int(size * budget)
-        processed_budget = int(min(max(1, budget), size))
-
-        # Validate and convert residual_budget
-        if residual_budget < 0:
-            raise ValueError(f"Invalid residual_budget value: {residual_budget=}")
-        elif residual_budget < 1:  # Fraction mode
-            residual_budget = int(processed_budget * residual_budget)
-        processed_residual_budget = int(max(0, min(residual_budget, processed_budget)))
-
-        if processed_residual_budget > processed_budget:
-            raise ValueError(
-                f"residual_budget ({processed_residual_budget}) cannot exceed budget ({processed_budget})"
-            )
-
-        top_budget = int(processed_budget - processed_residual_budget)
-
-        # Calculate residual_heap_size
-        if processed_residual_budget > 0:
-            available_for_residual = size - top_budget
-            if available_for_residual <= 0:
-                residual_heap_size = 0
-                processed_residual_budget = 0  # Cannot form any groups
-            else:
-                residual_heap_size = available_for_residual // processed_residual_budget
-                if residual_clip > 0:
-                    residual_heap_size = min(residual_heap_size, residual_clip)
-        else:
-            residual_heap_size = 0
-
-        # Final alignment check
-        if top_budget + processed_residual_budget != processed_budget:
-            top_budget = processed_budget - processed_residual_budget
-
-        return processed_budget, top_budget, processed_residual_budget, residual_heap_size
-
 
 class VanillaNodeCompressor(BaseNodeCompressor):
     """
@@ -204,8 +232,8 @@ class VanillaNodeCompressor(BaseNodeCompressor):
     Memory: Allocates temporary combined_k/combined_v buffers
     """
 
-    @staticmethod
     def compress_layer(
+        self,
         layer_idx: int,
         kv_pool: "MHATokenToKVPool",
         value: torch.Tensor,
@@ -281,8 +309,8 @@ class OptimizedNodeCompressor(BaseNodeCompressor):
     memory accumulation during frequent compressions.
     """
 
-    @staticmethod
     def compress_layer(
+        self,
         layer_idx: int,
         kv_pool: "MHATokenToKVPool",
         value: torch.Tensor,
@@ -360,31 +388,213 @@ class OptimizedNodeCompressor(BaseNodeCompressor):
         # Force GPU memory cleanup periodically
         if device.type == 'cuda' and layer_idx % 4 == 3:  # Every 4th layer
             torch.cuda.empty_cache()
+            
+class PreallocatingNodeCompressor(BaseNodeCompressor):
+    """
+    An optimized, stateful node compressor that pre-allocates and reuses GPU memory
+    to avoid memory fragmentation and growth during frequent compressions.
 
-        # Update w_buffer (weight buffer for tracking compression history)
-        # w_buffer shape: [pool_size, head_num, 1], stores compression weight per token
-        # Purpose: Track how many original tokens each compressed token represents
-        # - Top tokens: w=0 → represents 1 original token (no compression)
-        # - Residual tokens: w=log(heap_size) → represents heap_size original tokens (averaged)
-        # Usage: During attention, weights adjust scores to account for compression ratio
-        # if actual_budget > 0:
-        #     if top_budget > 0:
-        #         kv_pool.w_buffer[layer_idx][out_cache_loc[:top_budget]] = 0
-        #     if residual_budget > 0 and residual_heap_size > 0:
-        #         log_heap_size = torch.log(torch.tensor(residual_heap_size, dtype=torch.float32, device=device))
-        #         kv_pool.w_buffer[layer_idx][out_cache_loc[top_budget:actual_budget]] = log_heap_size
+    This compressor is instantiated once with the model's configuration and reused
+    for all compression operations, ensuring stable and efficient memory usage.
+    """
 
+    def __init__(
+        self,
+        budget: int | float,
+        page_size: int,
+        head_num: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        residual_budget: int | float = 0,
+        residual_clip: int = 0,
+    ):
+        """
+        Initialize the compressor and pre-allocate workspace buffers.
 
+        Args:
+            budget: Number or fraction (0-1) of tokens to keep.
+            page_size: Expected size of input value tensor (from radix tree's page_size).
+            head_num: Number of attention heads.
+            head_dim: Dimension of each attention head.
+            dtype: The data type of the KV cache (e.g., torch.float16).
+            device: The device where the cache resides (e.g., 'cuda:0').
+            residual_budget: Number or fraction of budget for residual tokens.
+            residual_clip: Maximum heap size for residual averaging.
+        """
+        # Initialize budget parameters from the base class with all required args
+        super().__init__(
+            budget=budget,
+            page_size=page_size,
+            residual_budget=residual_budget,
+            residual_clip=residual_clip,
+            head_num=head_num,
+            head_dim=head_dim,
+            dtype=dtype,
+            device=device
+        )
+        
+        # --- Pre-allocation of workspace buffers based on fixed budget sizes ---
+
+        # Buffer for gathered top-k keys/values
+        if self.top_budget > 0:
+            self.top_k_buffer = torch.empty(
+                (self.top_budget, head_num, head_dim), dtype=dtype, device=device
+            )
+            self.top_v_buffer = torch.empty(
+                (self.top_budget, head_num, head_dim), dtype=dtype, device=device
+            )
+
+        # Buffer for gathered residual source keys/values. This is the largest buffer
+        # and the primary cause of memory leaks in the original implementation.
+        if self.processed_residual_budget > 0 and self.residual_heap_size > 0:
+            self.residual_k_buffer = torch.empty(
+                (self.processed_residual_budget, self.residual_heap_size, head_num, head_dim),
+                dtype=dtype, device=device
+            )
+            self.residual_v_buffer = torch.empty(
+                (self.processed_residual_budget, self.residual_heap_size, head_num, head_dim),
+                dtype=dtype, device=device
+            )
+
+    def compress_layer(
+        self,
+        layer_idx: int,
+        kv_pool: "MHATokenToKVPool",
+        value: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        top_budget: int,
+        residual_budget: int,
+        residual_heap_size: int,
+    ) -> None:
+        """
+        Compresses a layer using pre-allocated buffers to avoid creating large
+        temporary tensors.
+        """
+        device = value.device
+        k_buffer = kv_pool.k_buffer[layer_idx]
+        v_buffer = kv_pool.v_buffer[layer_idx]
+        head_num = k_buffer.shape[1]
+
+        # Sort scores for all heads at once
+        scores = kv_pool.s_buffer[layer_idx][value, :, 0]
+        _, sorted_indices = torch.sort(scores, dim=0, descending=True)
+
+        head_indices = torch.arange(head_num, device=device)
+        actual_budget = top_budget + residual_budget
+
+        # --- Top tokens (using pre-allocated buffers) ---
+        if top_budget > 0:
+            top_indices_relative = sorted_indices[:top_budget, :]
+            final_top_locs = value[top_indices_relative]
+            head_range_expanded = head_indices[None, :].expand(top_budget, -1)
+
+            # NO NEW LARGE TENSORS: Gather directly into the pre-allocated buffers.
+            # We use copy_() for an in-place operation.
+            self.top_k_buffer.copy_(k_buffer[final_top_locs, head_range_expanded, :])
+            self.top_v_buffer.copy_(v_buffer[final_top_locs, head_range_expanded, :])
+            
+            # Scatter from the buffer to the final destination
+            out_loc_range = out_cache_loc[:top_budget, None]
+            k_buffer[out_loc_range, head_range_expanded, :] = self.top_k_buffer
+            v_buffer[out_loc_range, head_range_expanded, :] = self.top_v_buffer
+
+        # --- Residual tokens (using pre-allocated buffers) ---
+        if residual_budget > 0 and residual_heap_size > 0:
+            num_residual_source = residual_budget * residual_heap_size
+            
+            # This check is important as it's possible not to have enough tokens left
+            if value.shape[0] - top_budget >= num_residual_source:
+                residual_indices_relative = sorted_indices[top_budget:top_budget + num_residual_source, :]
+                residual_indices_relative, _ = torch.sort(residual_indices_relative, dim=0)
+                residual_indices_relative = residual_indices_relative.view(residual_budget, residual_heap_size, head_num)
+                
+                final_residual_locs = value[residual_indices_relative]
+                head_expanded = head_indices[None, None, :].expand(residual_budget, residual_heap_size, -1)
+                
+                # NO NEW LARGE TENSORS: Gather into the pre-allocated buffers
+                self.residual_k_buffer.copy_(k_buffer[final_residual_locs, head_expanded, :])
+                self.residual_v_buffer.copy_(v_buffer[final_residual_locs, head_expanded, :])
+
+                # Perform computation on the buffer. This creates a smaller intermediate tensor,
+                # which is acceptable as we have avoided the main large allocation.
+                k_residual = self.residual_k_buffer.mean(dim=1)
+                v_residual = self.residual_v_buffer.sum(dim=1)
+                
+                # Scatter to output locations
+                out_loc_res = out_cache_loc[top_budget:actual_budget, None]
+                head_range_scatter = head_indices[None, :].expand(residual_budget, -1)
+                k_buffer[out_loc_res, head_range_scatter, :] = k_residual
+                v_buffer[out_loc_res, head_range_scatter, :] = v_residual
+                
+class SimplifiedNodeCompressor(BaseNodeCompressor):
+    """
+    Simplified PyTorch implementation.
+    """
+    
+    def compress_node(
+        self,
+        value: torch.Tensor,
+        kv_pool: "MHATokenToKVPool",
+        out_cache_loc: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compress KV cache by selecting top-k tokens based on attention scores.
+
+        Args:
+            value: Cache locations tensor [N] containing token positions to compress
+            kv_pool: The KV cache pool containing k_buffer, v_buffer, s_buffer, w_buffer
+            out_cache_loc: Pre-allocated cache locations [processed_budget] for compressed tokens
+                          (allocated by caller, e.g., RadixCache)
+
+        Returns:
+            Tuple of (original value tensor, new compressed cache locations tensor)
+
+        Raises:
+            ValueError: If input value length doesn't match expected page_size
+        """
+        size = len(value)
+
+        # # Compress each layer
+        # for layer_idx in range(kv_pool.layer_num):
+        #     self.compress_layer(
+        #         layer_idx=layer_idx,
+        #         kv_pool=kv_pool,
+        #         value=value,
+        #         out_cache_loc=out_cache_loc,
+        #         top_budget=self.top_budget,
+        #         residual_budget=self.processed_residual_budget,
+        #         residual_heap_size=self.residual_heap_size,
+        #     )
+
+        return value, out_cache_loc
+    
+    def compress_layer(
+        self,
+        layer_idx: int,
+        kv_pool: "MHATokenToKVPool",
+        value: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        top_budget: int,
+        residual_budget: int,
+        residual_heap_size: int,
+    ) -> None:
+        return 
+        k_buffer = kv_pool.k_buffer[layer_idx]
+        v_buffer = kv_pool.v_buffer[layer_idx]
+            
+        k_buffer[out_cache_loc] = k_buffer[value[:self.processed_budget]]
+        v_buffer[out_cache_loc] = v_buffer[value[:self.processed_budget]]
 
 
 from .node_compression_triton import TritonNodeCompressor
 from .node_compression_triton_v2 import UltraOptimizedTritonCompressor
-class UltraOptimizedNodeCompressor(UltraOptimizedTritonCompressor):
+class UltraOptimizedNodeCompressor(PreallocatingNodeCompressor):
     pass
 
 
 # Default compressor to use
-NodeCompressor = UltraOptimizedNodeCompressor
+NodeCompressor = PreallocatingNodeCompressor
 
 __all__ = [
     "BaseNodeCompressor",
