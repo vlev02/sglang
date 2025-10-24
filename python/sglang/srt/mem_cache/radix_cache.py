@@ -563,15 +563,15 @@ class RadixCache(BasePrefixCache):
             )
         else:
             # Call NodeCompressor instance method to handle compression
-            released_value, new_value = self.compressor.compress_node(
+            self.compressor.compress_node(
                 value=original_value,
                 kv_pool=self.kv_pool,
                 out_cache_loc=out_cache_loc,
             )
-            node.value = new_value
+            node.value = out_cache_loc.clone()
             # Free the released indices and update node with new compressed indices
-            if released_value.size(-1) > 0:
-                self.token_to_kv_pool_allocator.free(released_value)
+            if original_value.size(-1) > 0:
+                self.token_to_kv_pool_allocator.free(original_value)
         
         
         

@@ -527,47 +527,12 @@ class PreallocatingNodeCompressor(BaseNodeCompressor):
                 k_buffer[out_loc_res, head_range_scatter, :] = k_residual
                 v_buffer[out_loc_res, head_range_scatter, :] = v_residual
                 
+                
 class SimplifiedNodeCompressor(BaseNodeCompressor):
     """
     Simplified PyTorch implementation.
     """
     
-    def compress_node(
-        self,
-        value: torch.Tensor,
-        kv_pool: "MHATokenToKVPool",
-        out_cache_loc: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compress KV cache by selecting top-k tokens based on attention scores.
-
-        Args:
-            value: Cache locations tensor [N] containing token positions to compress
-            kv_pool: The KV cache pool containing k_buffer, v_buffer, s_buffer, w_buffer
-            out_cache_loc: Pre-allocated cache locations [processed_budget] for compressed tokens
-                          (allocated by caller, e.g., RadixCache)
-
-        Returns:
-            Tuple of (original value tensor, new compressed cache locations tensor)
-
-        Raises:
-            ValueError: If input value length doesn't match expected page_size
-        """
-        size = len(value)
-
-        # # Compress each layer
-        # for layer_idx in range(kv_pool.layer_num):
-        #     self.compress_layer(
-        #         layer_idx=layer_idx,
-        #         kv_pool=kv_pool,
-        #         value=value,
-        #         out_cache_loc=out_cache_loc,
-        #         top_budget=self.top_budget,
-        #         residual_budget=self.processed_residual_budget,
-        #         residual_heap_size=self.residual_heap_size,
-        #     )
-
-        return value, out_cache_loc
     
     def compress_layer(
         self,
@@ -579,12 +544,14 @@ class SimplifiedNodeCompressor(BaseNodeCompressor):
         residual_budget: int,
         residual_heap_size: int,
     ) -> None:
-        return 
         k_buffer = kv_pool.k_buffer[layer_idx]
         v_buffer = kv_pool.v_buffer[layer_idx]
             
-        k_buffer[out_cache_loc] = k_buffer[value[:self.processed_budget]]
-        v_buffer[out_cache_loc] = v_buffer[value[:self.processed_budget]]
+        split_ind = self.processed_budget // 2
+        k_buffer[out_cache_loc[:split_ind]] = k_buffer[value[:split_ind]]
+        v_buffer[out_cache_loc[:split_ind]] = v_buffer[value[:split_ind]]
+        k_buffer[out_cache_loc[split_ind:]] = k_buffer[value[split_ind-self.processed_budget:]]
+        v_buffer[out_cache_loc[split_ind:]] = v_buffer[value[split_ind-self.processed_budget:]]
 
 
 from .node_compression_triton import TritonNodeCompressor
