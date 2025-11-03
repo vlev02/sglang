@@ -630,10 +630,18 @@ class Req:
         self.start_send_idx: int = 0
 
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
+
+        # # For node cache compression
+        # self.tokens_since_last_compression = 0
         # This is because kv is not ready in `process_prefill_chunk`.
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
+
+        # For node cache compression: track if prefix_indices was updated
+        # -1 means no update needed
+        # >= 0 means prefix_indices[:static_prefix_len] should be written to req_to_token_pool
+        self.static_prefix_len: int = -1
 
     @property
     def seqlen(self):
@@ -1558,7 +1566,252 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
+    def update_compressed_prefix_indices(self):
+        """
+        Update req_to_token_pool for requests whose prefix was compressed.
+
+        This is called at the beginning of prepare_for_decode() to apply compression
+        updates from the previous iteration. When compression updates req.prefix_indices,
+        it sets req.static_prefix_len to the position where compression started (prefix_start).
+        This method writes only the changed portion (from prefix_start onwards) to
+        req_to_token_pool, optimizing by reusing unchanged prefix indices.
+
+        Uses Triton kernel for efficient batched updates when available.
+        """
+        # Collect requests needing update
+        update_reqs = [req for req in self.reqs if req.static_prefix_len != -1]
+
+        if not update_reqs:
+            return
+
+        bs = len(update_reqs)
+
+        # Use Triton kernel for efficient batched updates
+        if support_triton(global_server_args_dict.get("attention_backend")):
+            # Optimize: Create all metadata tensors in a single allocation
+            # Stack [req_pool_idx, static_prefix_len, len(prefix_indices)] for all reqs
+            metadata = torch.tensor(
+                [
+                    [req.req_pool_idx, req.static_prefix_len, len(req.prefix_indices)]
+                    for req in update_reqs
+                ],
+                dtype=torch.int32,
+                device=self.device
+            )  # Shape: [bs, 3]
+
+            # Unpack columns (views, no copy)
+            req_pool_indices = metadata[:, 0]  # [bs]
+            pre_lens = metadata[:, 1]          # [bs]
+            seq_lens = metadata[:, 2]          # [bs]
+
+            # Compute extend_lens (GPU operation, fast)
+            extend_lens = seq_lens - pre_lens  # [bs]
+
+            # Optimize: Pre-allocate output tensor and copy in-place
+            # This avoids intermediate allocations from torch.cat
+            total_changed_size = extend_lens.sum().item()
+            out_cache_loc = torch.empty(total_changed_size, dtype=torch.int32, device=self.device)
+
+            # Copy each changed portion directly to pre-allocated tensor
+            offset = 0
+            for i, req in enumerate(update_reqs):
+                changed_len = extend_lens[i].item()
+                if changed_len > 0:
+                    out_cache_loc[offset:offset + changed_len] = req.prefix_indices[req.static_prefix_len:]
+                    offset += changed_len
+
+            # Call Triton kernel for parallel batched write
+            write_req_to_token_pool_triton[(bs,)](
+                self.req_to_token_pool.req_to_token,
+                req_pool_indices,
+                pre_lens,
+                seq_lens,
+                extend_lens,
+                out_cache_loc,
+                self.req_to_token_pool.req_to_token.shape[1],
+            )
+        else:
+            # Fallback: Python loop for single request or when Triton not available
+            for req in update_reqs:
+                prefix_start = req.static_prefix_len
+                changed_len = len(req.prefix_indices) - prefix_start
+
+                self.req_to_token_pool.write(
+                    (req.req_pool_idx, slice(prefix_start, prefix_start + changed_len)),
+                    req.prefix_indices[prefix_start:]
+                )
+
+        # Reset flags for all updated requests
+        for req in update_reqs:
+            req.static_prefix_len = -1
+
+    def apply_compression_to_token_pool(self):
+        """
+        Apply compressed indices to req_to_token_pool using CompressionTask.
+
+        Uses two-pass approach to avoid unnecessary copies:
+        1. Write compressed indices directly from task.compressed_indices
+        2. Write tail indices to their shifted positions
+
+        Layout transformation:
+        Before: [prefix | original compressed part | tail (output)]
+        After:  [prefix | compressed part | tail (output)]
+
+        No concatenation needed - uses task.compressed_indices and req_to_token_pool directly.
+        """
+        if not hasattr(self, 'compression_task') or self.compression_task is None:
+            return
+
+        task = self.compression_task
+        bs = len(task.reqs)
+
+        if bs == 0:
+            return
+
+        # Collect metadata for compressed and tail parts separately
+        compressed_metadata = []  # [req_pool_idx, prefix_start, compressed_size, offset_in_task]
+        tail_metadata = []        # [req_pool_idx, tail_start, tail_size, original_tail_start]
+
+        for req_idx, req in enumerate(task.reqs):
+            start_node_idx = task.req_start_indices[req_idx]
+            node_count = task.req_node_counts[req_idx]
+            prefix_start = task.req_prefix_start_indices[req_idx]
+
+            original_total_size = node_count * task.radix_block_size
+            compressed_total_size = node_count * task.compressed_size
+
+            # Compressed part metadata
+            compressed_offset_in_task = start_node_idx * task.compressed_size
+            compressed_metadata.append([
+                req.req_pool_idx,
+                prefix_start,
+                compressed_total_size,
+                compressed_offset_in_task
+            ])
+
+            # Tail part metadata
+            original_tail_start = prefix_start + original_total_size
+            new_tail_start = prefix_start + compressed_total_size
+            tail_size = req.seqlen - original_tail_start
+
+            if tail_size > 0:
+                tail_metadata.append([
+                    req.req_pool_idx,
+                    new_tail_start,  # New position after compression
+                    tail_size,
+                    original_tail_start  # Original position in req_to_token_pool
+                ])
+
+        # Pass 1: Write compressed indices using Triton
+        if support_triton(global_server_args_dict.get("attention_backend")):
+            # For batched Triton: map compressed indices directly from task
+            compressed_meta_tensor = torch.tensor(
+                compressed_metadata,
+                dtype=torch.int32,
+                device=self.device
+            )  # Shape: [bs, 4]
+
+            req_pool_indices = compressed_meta_tensor[:, 0]
+            prefix_starts = compressed_meta_tensor[:, 1]
+            compressed_sizes = compressed_meta_tensor[:, 2]
+            compressed_offsets = compressed_meta_tensor[:, 3]
+
+            # Write compressed part: use task.compressed_indices directly
+            seq_lens = prefix_starts + compressed_sizes
+
+            # Call Triton kernel to write compressed indices
+            write_req_to_token_pool_triton[(bs,)](
+                self.req_to_token_pool.req_to_token,
+                req_pool_indices,
+                prefix_starts,
+                seq_lens,
+                compressed_sizes,
+                task.compressed_indices,  # Use directly - no copy!
+                self.req_to_token_pool.req_to_token.shape[1],
+            )
+
+            logger.debug(
+                f"Applied compression (pass 1) for {bs} requests: "
+                f"wrote {task.compressed_indices.numel()} compressed indices using Triton"
+            )
+
+            # Pass 2: Write tail indices if any exist
+            if tail_metadata:
+                tail_meta_tensor = torch.tensor(
+                    tail_metadata,
+                    dtype=torch.int32,
+                    device=self.device
+                )  # Shape: [num_with_tail, 4]
+
+                tail_req_pool_indices = tail_meta_tensor[:, 0]
+                tail_starts = tail_meta_tensor[:, 1]
+                tail_sizes = tail_meta_tensor[:, 2]
+                original_tail_starts = tail_meta_tensor[:, 3]
+
+                # Pre-allocate tensor for all tails
+                total_tail_size = tail_sizes.sum().item()
+                all_tails = torch.empty(total_tail_size, dtype=torch.int32, device=self.device)
+
+                # Copy tails from original locations to pre-allocated tensor
+                offset = 0
+                for i, (orig_start, tail_size) in enumerate(zip(original_tail_starts.cpu().tolist(), tail_sizes.cpu().tolist())):
+                    req_pool_idx = tail_req_pool_indices[i].item()
+                    all_tails[offset:offset + tail_size] = self.req_to_token_pool.req_to_token[
+                        req_pool_idx, orig_start:orig_start + tail_size
+                    ]
+                    offset += tail_size
+
+                # Write tails in second Triton call
+                tail_seq_lens = tail_starts + tail_sizes
+
+                write_req_to_token_pool_triton[(len(tail_metadata),)](
+                    self.req_to_token_pool.req_to_token,
+                    tail_req_pool_indices,
+                    tail_starts,
+                    tail_seq_lens,
+                    tail_sizes,
+                    all_tails,
+                    self.req_to_token_pool.req_to_token.shape[1],
+                )
+
+                logger.debug(
+                    f"Applied compression (pass 2) for {len(tail_metadata)} requests: "
+                    f"wrote {total_tail_size} tail indices using Triton"
+                )
+        else:
+            # Fallback: sequential writes for bs=1 or no Triton
+            for meta in compressed_metadata:
+                req_pool_idx, prefix_start, compressed_size, offset_in_task = meta
+                self.req_to_token_pool.write(
+                    (req_pool_idx, slice(prefix_start, prefix_start + compressed_size)),
+                    task.compressed_indices[offset_in_task:offset_in_task + compressed_size]
+                )
+
+            for meta in tail_metadata:
+                req_pool_idx, tail_start, tail_size, original_tail_start = meta
+                # Clone to avoid aliasing issues when reading and writing to same tensor
+                tail_indices = self.req_to_token_pool.req_to_token[
+                    req_pool_idx, original_tail_start:original_tail_start + tail_size
+                ].clone()
+                self.req_to_token_pool.write(
+                    (req_pool_idx, slice(tail_start, tail_start + tail_size)),
+                    tail_indices
+                )
+
+            logger.debug(
+                f"Applied compression (sequential) for {bs} requests: "
+                f"wrote {sum(m[2] for m in compressed_metadata)} compressed + {sum(m[2] for m in tail_metadata)} tail indices"
+            )
+
+        # Clear task after processing
+        self.compression_task = None
+
     def prepare_for_decode(self):
+        # # Apply compression updates from previous iteration before preparing decode batch
+        # self.update_compressed_prefix_indices()
+        # Apply compression to token pool for requests with complete indices
+        self.apply_compression_to_token_pool()
+
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 

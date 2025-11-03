@@ -135,6 +135,7 @@ class RadixCache(BasePrefixCache):
         compression_tail_budget: Optional[int] = None,
         compression_residual_budget: Optional[float | int] = None,
         compression_residual_clip: Optional[int] = None,
+        compress_stages: str = "0000",
     ):
         # Validate parameters
         if page_size <= 0:
@@ -159,6 +160,7 @@ class RadixCache(BasePrefixCache):
         self.compression_residual_budget = compression_residual_budget if compression_residual_budget else 0
         self.compression_residual_clip = compression_residual_clip if compression_residual_clip else 0
         self.kv_event_queue = []
+        self.compress_stages = compress_stages
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -243,13 +245,13 @@ class RadixCache(BasePrefixCache):
             last_host_node=last_node,
         )
 
-    def insert(self, key: List, value=None):
+    def insert(self, key: List, value=None, compression: bool = False):
         if self.disable:
             return 0
 
         if value is None:
             value = [x for x in key]
-        return self._insert_helper(self.root_node, key, value)
+        return self._insert_helper(self.root_node, key, value, compression)
 
     def cache_finished_req(self, req: Req):
         """Cache request when it finishes."""
@@ -281,7 +283,7 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert( # new_prefix_len: the length of already existed ids in tree
-            token_ids[:page_aligned_len], page_aligned_kv_indices
+            token_ids[:page_aligned_len], page_aligned_kv_indices, compression=self.compress_stages[3] == '1'
         )
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.tree_idxlen: new_prefix_len - req.evict_len]
@@ -318,7 +320,7 @@ class RadixCache(BasePrefixCache):
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
         # Radix Cache takes one ref in memory pool
-        new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
+        new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices, compression=self.compress_stages[0] == '1')
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.tree_idxlen: new_prefix_len - req.evict_len]
         )
@@ -476,7 +478,7 @@ class RadixCache(BasePrefixCache):
 
         return new_node
 
-    def _insert_helper(self, node: TreeNode, key: List, value):
+    def _insert_helper(self, node: TreeNode, key: List, value, compression: bool):
         node.last_access_time = time.monotonic()
         if len(key) == 0:
             return 0
@@ -512,7 +514,7 @@ class RadixCache(BasePrefixCache):
             new_node.key = child_key
             new_node.value = child_value
             node.children[child_key] = new_node
-            if len(key) >= self.compression_tail_budget:
+            if compression and len(key) >= self.compression_tail_budget:
                 self._compress_node(new_node)
             self.evictable_size_ += len(new_node.value)
             self._record_store_event(new_node)

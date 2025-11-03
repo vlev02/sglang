@@ -122,6 +122,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.node_cache_compressor import NodeCacheCompressor
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
@@ -499,6 +500,30 @@ class Scheduler(
         self.init_metrics()
         self.init_kv_events(server_args.kv_events_config)
 
+        # Init node cache compressor
+        self.node_cache_compressor = None
+        if (not self.enable_overlap and
+            hasattr(self.tree_cache, 'compressor') and
+            self.tree_cache.compressor is not None and
+            hasattr(self.tree_cache, 'compression_tail_budget') and
+            self.tree_cache.compression_tail_budget is not None and
+            self.tree_cache.compression_tail_budget > 0):
+            try:
+                self.node_cache_compressor = NodeCacheCompressor(
+                    tree_cache=self.tree_cache,
+                    q_win_size=self.server_args.q_win_size,
+                    model_config=self.model_config,
+                    compress_stages=self.server_args.compress_stages,
+                )
+                logger.info(
+                    f"Initialized NodeCacheCompressor with q_win_size="
+                    f"{self.node_cache_compressor.q_win_size}, compress_stages="
+                    f"{self.node_cache_compressor.compress_stages}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to initialize NodeCacheCompressor: {e}")
+                self.node_cache_compressor = None
+
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -636,6 +661,7 @@ class Scheduler(
                     compression_tail_budget=server_args.compression_tail_budget,
                     compression_residual_budget=server_args.compression_residual_budget,
                     compression_residual_clip=server_args.compression_residual_clip,
+                    compress_stages=server_args.compress_stages,
                 )
 
         self.decode_mem_cache_buf_multiplier = (
@@ -1925,6 +1951,15 @@ class Scheduler(
     ):
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result, launch_done)
+
+            # Compress eligible nodes after decode completes
+            # This is safe because:
+            # 1. GPU work (CUDA graph replay or normal forward) is complete
+            # 2. All set_kv_buffer() calls have finished
+            # 3. We're in disable_overlap mode (single-threaded)
+            if self.node_cache_compressor is not None:
+                self.node_cache_compressor.compress_batch_nodes(batch)
+
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result, launch_done)
         elif batch.forward_mode.is_idle():
@@ -1940,6 +1975,7 @@ class Scheduler(
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
             self.return_health_check_ct -= 1
             self.send_to_tokenizer.send_pyobj(HealthCheckOutput())
+
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return self.prepare_mlp_sync_batch_raw(

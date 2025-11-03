@@ -470,62 +470,98 @@ class PreallocatingNodeCompressor(BaseNodeCompressor):
         """
         Compresses a layer using pre-allocated buffers to avoid creating large
         temporary tensors.
+
+        Supports both single-node and multi-node batch compression:
+        - Single node: value.shape[0] == page_size, out_cache_loc.shape[0] == processed_budget
+        - Multi-node batch: value.shape[0] % page_size == 0, out_cache_loc.shape[0] % processed_budget == 0
         """
         device = value.device
         k_buffer = kv_pool.k_buffer[layer_idx]
         v_buffer = kv_pool.v_buffer[layer_idx]
         head_num = k_buffer.shape[1]
 
-        # Sort scores for all heads at once
-        scores = kv_pool.s_buffer[layer_idx][value, :, 0]
-        _, sorted_indices = torch.sort(scores, dim=0, descending=True)
+        # Validate that value and out_cache_loc sizes are compatible
+        value_size = value.shape[0]
+        out_size = out_cache_loc.shape[0]
 
-        head_indices = torch.arange(head_num, device=device)
-        actual_budget = top_budget + residual_budget
+        num_nodes, value_remainder = divmod(value_size, self.page_size)
+        expected_out_nodes, out_remainder = divmod(out_size, self.processed_budget)
 
-        # --- Top tokens (using pre-allocated buffers) ---
-        if top_budget > 0:
-            top_indices_relative = sorted_indices[:top_budget, :]
-            final_top_locs = value[top_indices_relative]
-            head_range_expanded = head_indices[None, :].expand(top_budget, -1)
+        if value_remainder != 0:
+            raise ValueError(
+                f"value size ({value_size}) must be divisible by page_size ({self.page_size})"
+            )
+        if out_remainder != 0:
+            raise ValueError(
+                f"out_cache_loc size ({out_size}) must be divisible by processed_budget ({self.processed_budget})"
+            )
+        if num_nodes != expected_out_nodes:
+            raise ValueError(
+                f"Number of nodes mismatch: value has {num_nodes} nodes, "
+                f"out_cache_loc has {expected_out_nodes} nodes"
+            )
 
-            # NO NEW LARGE TENSORS: Gather directly into the pre-allocated buffers.
-            # We use copy_() for an in-place operation.
-            self.top_k_buffer.copy_(k_buffer[final_top_locs, head_range_expanded, :])
-            self.top_v_buffer.copy_(v_buffer[final_top_locs, head_range_expanded, :])
-            
-            # Scatter from the buffer to the final destination
-            out_loc_range = out_cache_loc[:top_budget, None]
-            k_buffer[out_loc_range, head_range_expanded, :] = self.top_k_buffer
-            v_buffer[out_loc_range, head_range_expanded, :] = self.top_v_buffer
+        # Process each node in the batch
+        for node_idx in range(num_nodes):
+            # Extract indices for this node
+            node_value_start = node_idx * self.page_size
+            node_value_end = node_value_start + self.page_size
+            node_value = value[node_value_start:node_value_end]
 
-        # --- Residual tokens (using pre-allocated buffers) ---
-        if residual_budget > 0 and residual_heap_size > 0:
-            num_residual_source = residual_budget * residual_heap_size
-            
-            # This check is important as it's possible not to have enough tokens left
-            if value.shape[0] - top_budget >= num_residual_source:
-                residual_indices_relative = sorted_indices[top_budget:top_budget + num_residual_source, :]
-                residual_indices_relative, _ = torch.sort(residual_indices_relative, dim=0)
-                residual_indices_relative = residual_indices_relative.view(residual_budget, residual_heap_size, head_num)
-                
-                final_residual_locs = value[residual_indices_relative]
-                head_expanded = head_indices[None, None, :].expand(residual_budget, residual_heap_size, -1)
-                
-                # NO NEW LARGE TENSORS: Gather into the pre-allocated buffers
-                self.residual_k_buffer.copy_(k_buffer[final_residual_locs, head_expanded, :])
-                self.residual_v_buffer.copy_(v_buffer[final_residual_locs, head_expanded, :])
+            node_out_start = node_idx * self.processed_budget
+            node_out_end = node_out_start + self.processed_budget
+            node_out_cache_loc = out_cache_loc[node_out_start:node_out_end]
 
-                # Perform computation on the buffer. This creates a smaller intermediate tensor,
-                # which is acceptable as we have avoided the main large allocation.
-                k_residual = self.residual_k_buffer.mean(dim=1)
-                v_residual = self.residual_v_buffer.sum(dim=1)
-                
-                # Scatter to output locations
-                out_loc_res = out_cache_loc[top_budget:actual_budget, None]
-                head_range_scatter = head_indices[None, :].expand(residual_budget, -1)
-                k_buffer[out_loc_res, head_range_scatter, :] = k_residual
-                v_buffer[out_loc_res, head_range_scatter, :] = v_residual
+            # Sort scores for all heads at once
+            scores = kv_pool.s_buffer[layer_idx][node_value, :, 0]
+            _, sorted_indices = torch.sort(scores, dim=0, descending=True)
+
+            head_indices = torch.arange(head_num, device=device)
+            actual_budget = top_budget + residual_budget
+
+            # --- Top tokens (using pre-allocated buffers) ---
+            if top_budget > 0:
+                top_indices_relative = sorted_indices[:top_budget, :]
+                final_top_locs = node_value[top_indices_relative]
+                head_range_expanded = head_indices[None, :].expand(top_budget, -1)
+
+                # NO NEW LARGE TENSORS: Gather directly into the pre-allocated buffers.
+                # We use copy_() for an in-place operation.
+                self.top_k_buffer.copy_(k_buffer[final_top_locs, head_range_expanded, :])
+                self.top_v_buffer.copy_(v_buffer[final_top_locs, head_range_expanded, :])
+
+                # Scatter from the buffer to the final destination
+                out_loc_range = node_out_cache_loc[:top_budget, None]
+                k_buffer[out_loc_range, head_range_expanded, :] = self.top_k_buffer
+                v_buffer[out_loc_range, head_range_expanded, :] = self.top_v_buffer
+
+            # --- Residual tokens (using pre-allocated buffers) ---
+            if residual_budget > 0 and residual_heap_size > 0:
+                num_residual_source = residual_budget * residual_heap_size
+
+                # This check is important as it's possible not to have enough tokens left
+                if node_value.shape[0] - top_budget >= num_residual_source:
+                    residual_indices_relative = sorted_indices[top_budget:top_budget + num_residual_source, :]
+                    residual_indices_relative, _ = torch.sort(residual_indices_relative, dim=0)
+                    residual_indices_relative = residual_indices_relative.view(residual_budget, residual_heap_size, head_num)
+
+                    final_residual_locs = node_value[residual_indices_relative]
+                    head_expanded = head_indices[None, None, :].expand(residual_budget, residual_heap_size, -1)
+
+                    # NO NEW LARGE TENSORS: Gather into the pre-allocated buffers
+                    self.residual_k_buffer.copy_(k_buffer[final_residual_locs, head_expanded, :])
+                    self.residual_v_buffer.copy_(v_buffer[final_residual_locs, head_expanded, :])
+
+                    # Perform computation on the buffer. This creates a smaller intermediate tensor,
+                    # which is acceptable as we have avoided the main large allocation.
+                    k_residual = self.residual_k_buffer.mean(dim=1)
+                    v_residual = self.residual_v_buffer.sum(dim=1)
+
+                    # Scatter to output locations
+                    out_loc_res = node_out_cache_loc[top_budget:actual_budget, None]
+                    head_range_scatter = head_indices[None, :].expand(residual_budget, -1)
+                    k_buffer[out_loc_res, head_range_scatter, :] = k_residual
+                    v_buffer[out_loc_res, head_range_scatter, :] = v_residual
                 
                 
 class SimplifiedNodeCompressor(BaseNodeCompressor):
