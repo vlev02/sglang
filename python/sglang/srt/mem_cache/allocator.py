@@ -136,12 +136,20 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+<<<<<<< HEAD
         # Reset s_buffer and w_buffer for compression if available
         kv_pool = self._kvcache
         if hasattr(kv_pool, 's_buffer') and kv_pool.s_buffer is not None:
             for layer_idx in range(len(kv_pool.s_buffer)):
                 kv_pool.s_buffer[layer_idx][free_index] = 0
                 kv_pool.w_buffer[layer_idx][free_index] = -2
+=======
+        # Reset compression buffers if they exist
+        if hasattr(self._kvcache, 's_buffer') and self._kvcache.s_buffer is not None:
+            for layer_idx in range(self._kvcache.layer_num):
+                self._kvcache.s_buffer[layer_idx][free_index] = 0
+                self._kvcache.w_buffer[layer_idx][free_index] = -2
+>>>>>>> dev
 
         if self.is_not_in_free_group:
             self.free_pages = torch.cat((self.free_pages, free_index))
@@ -516,12 +524,20 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+<<<<<<< HEAD
         # Reset s_buffer and w_buffer for compression if available
         kv_pool = self._kvcache
         if hasattr(kv_pool, 's_buffer') and kv_pool.s_buffer is not None:
             for layer_idx in range(len(kv_pool.s_buffer)):
                 kv_pool.s_buffer[layer_idx][free_index] = 0
                 kv_pool.w_buffer[layer_idx][free_index] = -2
+=======
+        # Reset compression buffers if they exist
+        if hasattr(self._kvcache, 's_buffer') and self._kvcache.s_buffer is not None:
+            for layer_idx in range(self._kvcache.layer_num):
+                self._kvcache.s_buffer[layer_idx][free_index] = 0
+                self._kvcache.w_buffer[layer_idx][free_index] = -2
+>>>>>>> dev
 
         if self.is_not_in_free_group:
             free_page_indices = torch.unique(free_index // self.page_size)

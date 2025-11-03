@@ -258,6 +258,7 @@ class ServerArgs:
     q_win_size: Optional[int] = 0
     update_rate: Optional[float] = 0.5
     ext_cache_dtype: Optional[torch.dtype] = torch.float32
+    compress_stages: str = "0000"  # 4 chars: [during_prefill, after_prefill, during_decode, after_decode]
     radix_block_size: Optional[int] = None
     radix_compression_budget: Optional[float] = None
     compression_tail_budget: Optional[int] = None
@@ -269,11 +270,23 @@ class ServerArgs:
     sm_group_num: int = 3
 
     def __post_init__(self):
+        # Validate compress_stages format
+        if self.compress_stages:
+            if len(self.compress_stages) != 4:
+                raise ValueError(
+                    f"compress_stages must be exactly 4 characters, got '{self.compress_stages}' "
+                    f"(length {len(self.compress_stages)})"
+                )
+            if not all(c in '01' for c in self.compress_stages):
+                raise ValueError(
+                    f"compress_stages must contain only '0' or '1', got '{self.compress_stages}'"
+                )
+
         # Convert ext_cache_dtype string to torch.dtype if needed
         if isinstance(self.ext_cache_dtype, str):
             dtype_map = {
                 "float16": torch.float16,
-                "bfloat16": torch.bfloat16, 
+                "bfloat16": torch.bfloat16,
                 "float32": torch.float32,
             }
             if self.ext_cache_dtype in dtype_map:
@@ -377,7 +390,7 @@ class ServerArgs:
 
         if self.kv_cache_compression is not None:
             self.ext_cache_dim = self.ext_cache_dim or 1
-            self.q_win_size = self.q_win_size or 64
+            self.q_win_size = self.q_win_size or 8
             # assert self.radix_block_size > 1
             assert self.disable_overlap_schedule # TODO: enable overlap_schedule
             if self.radix_block_size:
@@ -767,9 +780,17 @@ class ServerArgs:
         parser.add_argument(
             "--ext-cache-dtype",
             type=str,
-            default="float32",
+            default=ServerArgs.ext_cache_dtype,
             choices=["float16", "bfloat16", "float32"],
             help="Data type for extended cache storage used in compression.",
+        )
+        parser.add_argument(
+            "--compress-stages",
+            type=str,
+            default=ServerArgs.compress_stages,
+            help="Control compression at different stages. 4-character string where each char is '0' or '1': "
+                 "[during_prefill, after_prefill, during_decode, after_decode]. "
+                 "Example: '0001' enables compression only after decode. Default: '0000' (disabled).",
         )
         parser.add_argument(
             "--radix-block-size",
@@ -1852,6 +1873,20 @@ class ServerArgs:
             return f"http://[{self.host}]:{self.port}"
         else:
             return f"http://{self.host}:{self.port}"
+
+    def client_url(self):
+        """Get the URL for HTTP clients to connect to.
+
+        Converts 0.0.0.0 (bind all interfaces) to 127.0.0.1 (localhost) for client connections.
+        Servers bind to 0.0.0.0 to accept connections on all network interfaces,
+        but HTTP clients must connect to a specific address like 127.0.0.1 or localhost.
+        """
+        if is_valid_ipv6_address(self.host):
+            return f"http://[{self.host}]:{self.port}"
+        else:
+            # Convert 0.0.0.0 to 127.0.0.1 for client connections
+            client_host = "127.0.0.1" if self.host == "0.0.0.0" else self.host
+            return f"http://{client_host}:{self.port}"
 
     def check_server_args(self):
         assert (

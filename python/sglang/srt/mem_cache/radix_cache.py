@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.node_compression import NodeCompressor
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -134,6 +135,7 @@ class RadixCache(BasePrefixCache):
         compression_tail_budget: Optional[int] = None,
         compression_residual_budget: Optional[float | int] = None,
         compression_residual_clip: Optional[int] = None,
+        compress_stages: str = "0000",
     ):
         # Validate parameters
         if page_size <= 0:
@@ -158,6 +160,7 @@ class RadixCache(BasePrefixCache):
         self.compression_residual_budget = compression_residual_budget if compression_residual_budget else 0
         self.compression_residual_clip = compression_residual_clip if compression_residual_clip else 0
         self.kv_event_queue = []
+        self.compress_stages = compress_stages
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -171,6 +174,28 @@ class RadixCache(BasePrefixCache):
             self.key_match_fn = partial(_key_match_paged, page_size=page_size)
             self.get_child_key_fn = lambda key: tuple(key[:page_size])
         self.reset()
+        # compressor - instantiate with budget configuration
+        if self.compression_budget is not None:
+            # Prepare compressor arguments
+            compressor_kwargs = {
+                "budget": self.compression_budget,
+                "page_size": self.page_size,
+                "residual_budget": self.compression_residual_budget,
+                "residual_clip": self.compression_residual_clip,
+            }
+
+            # Add optional parameters if kv_pool is available (for PreallocatingNodeCompressor)
+            if self.kv_pool is not None:
+                compressor_kwargs.update({
+                    "head_num": self.kv_pool.head_num,
+                    "head_dim": self.kv_pool.head_dim,
+                    "dtype": self.kv_pool.dtype,
+                    "device": self.device,
+                })
+
+            self.compressor = NodeCompressor(**compressor_kwargs)
+        else:
+            self.compressor = None
 
     ##### Public API #####
 
@@ -220,13 +245,13 @@ class RadixCache(BasePrefixCache):
             last_host_node=last_node,
         )
 
-    def insert(self, key: List, value=None):
+    def insert(self, key: List, value=None, compression: bool = False):
         if self.disable:
             return 0
 
         if value is None:
             value = [x for x in key]
-        return self._insert_helper(self.root_node, key, value)
+        return self._insert_helper(self.root_node, key, value, compression)
 
     def cache_finished_req(self, req: Req):
         """Cache request when it finishes."""
@@ -258,7 +283,7 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert( # new_prefix_len: the length of already existed ids in tree
-            token_ids[:page_aligned_len], page_aligned_kv_indices
+            token_ids[:page_aligned_len], page_aligned_kv_indices, compression=self.compress_stages[3] == '1'
         )
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.tree_idxlen: new_prefix_len - req.evict_len]
@@ -295,7 +320,7 @@ class RadixCache(BasePrefixCache):
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
         # Radix Cache takes one ref in memory pool
-        new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices)
+        new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices, compression=self.compress_stages[0] == '1')
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.tree_idxlen: new_prefix_len - req.evict_len]
         )
@@ -453,7 +478,7 @@ class RadixCache(BasePrefixCache):
 
         return new_node
 
-    def _insert_helper(self, node: TreeNode, key: List, value):
+    def _insert_helper(self, node: TreeNode, key: List, value, compression: bool):
         node.last_access_time = time.monotonic()
         if len(key) == 0:
             return 0
@@ -479,6 +504,7 @@ class RadixCache(BasePrefixCache):
                 child_key = self.get_child_key_fn(key)
         value = value[-len(key):]
         while self.page_size > 1 and len(key): # paged node key
+            # len(key) >= (self.compression_tail_budget + self.page_size)
             child_key = self.get_child_key_fn(key)
             assert len(child_key) == self.page_size
             child_value = value[:self.page_size]
@@ -487,9 +513,8 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = child_key
             new_node.value = child_value
-            # new_node.value = child_value[:1] + child_value[2:]
             node.children[child_key] = new_node
-            if len(new_node.key) >= self.compression_tail_budget:
+            if compression and len(key) >= self.compression_tail_budget:
                 self._compress_node(new_node)
             self.evictable_size_ += len(new_node.value)
             self._record_store_event(new_node)
@@ -509,15 +534,25 @@ class RadixCache(BasePrefixCache):
     def _compress_node(
         self,
         node: TreeNode,
+<<<<<<< HEAD
         budget: Optional[int | float] = None,
         residual_budget: Optional[int | float] = None,
         residual_clip: Optional[int] = None,
+=======
+>>>>>>> dev
         ):
-        value = node.value
-        kv_pool = self.kv_pool
-        size = len(value)
-        if size < 1:
+        """Compress a tree node's KV cache by selecting top-k tokens.
+
+        This method uses the NodeCompressor instance to handle the compression logic.
+        It processes each layer independently to reduce memory footprint.
+
+        Args:
+            node: The tree node to compress
+        """
+        # Early exit if node is empty or compressor is not configured
+        if len(node.value) < 1 or self.compressor is None:
             return
+<<<<<<< HEAD
 
         # Safety check: kv_pool must exist for compression
         if kv_pool is None:
@@ -597,6 +632,37 @@ class RadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(value)
         node.value = out_cache_loc
         return
+=======
+
+        # Save original value before compression
+        original_value = node.value
+
+        # Allocate new cache locations for compressed tokens
+        # The compressor will use these to store compressed KV cache
+        out_cache_loc = self.token_to_kv_pool_allocator.alloc(self.compressor.processed_budget)
+
+        # Handle allocation failure
+        if self.compressor.processed_budget > 0 and out_cache_loc is None:
+            import warnings
+            warnings.warn(
+                f"Failed to allocate {self.compressor.processed_budget} cache locations for compression. "
+                f"Skipping compression for this node.",
+                RuntimeWarning,
+                stacklevel=2
+            )
+        else:
+            # Call NodeCompressor instance method to handle compression
+            self.compressor.compress_node(
+                value=original_value,
+                kv_pool=self.kv_pool,
+                out_cache_loc=out_cache_loc,
+            )
+            node.value = out_cache_loc.clone()
+            # Free the released indices and update node with new compressed indices
+            if original_value.size(-1) > 0:
+                self.token_to_kv_pool_allocator.free(original_value)
+        
+>>>>>>> dev
         
         
     def _print_helper(self, node: TreeNode, indent: int):

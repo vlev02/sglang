@@ -26,7 +26,9 @@ import os
 import threading
 import time
 from http import HTTPStatus
-from typing import AsyncIterator, Callable, Dict, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+
+import torch
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -284,6 +286,26 @@ async def get_model_info():
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
     }
     return result
+
+
+@app.get("/get_server_args")
+async def get_server_args():
+    """Get server arguments without internal states (non-blocking)."""
+    # Convert ServerArgs to dict, handling non-serializable types like torch.dtype
+    server_args_dict = {}
+    for field in dataclasses.fields(_global_state.tokenizer_manager.server_args):
+        value = getattr(_global_state.tokenizer_manager.server_args, field.name)
+        # Convert torch.dtype to string
+        if isinstance(value, torch.dtype):
+            server_args_dict[field.name] = str(value)
+        else:
+            server_args_dict[field.name] = value
+
+    return {
+        **server_args_dict,
+        **_global_state.scheduler_info,
+        "version": __version__,
+    }
 
 
 @app.get("/get_server_info")
@@ -960,7 +982,7 @@ def _execute_server_warmup(
     pipe_finish_writer: Optional[multiprocessing.connection.Connection],
 ):
     headers = {}
-    url = server_args.url()
+    url = server_args.client_url()  # Use client_url() instead of url() to handle 0.0.0.0
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
