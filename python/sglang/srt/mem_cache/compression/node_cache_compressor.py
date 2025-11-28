@@ -14,42 +14,32 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.mem_cache.batch_compressor_base import BaseBatchCompressor, BatchCompressionTask
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class CompressionTask:
+class DecodeCompressionTask(BatchCompressionTask):
     """
-    Represents a batch compression task with continuous tensors.
+    Extended compression task for decode-stage compression.
 
-    All nodes being compressed have the same size (radix_block_size).
-    All compressed results have the same size (compressed_size).
+    Inherits from BatchCompressionTask and adds decode-specific metadata.
 
     Attributes:
         reqs: List of all requests with compressed nodes
-        node_li: List of all compressed nodes across all requests
-        original_indices: Single continuous tensor containing all original indices
-        compressed_indices: Single continuous tensor for all compressed indices
         req_node_counts: Number of nodes compressed per request
         req_start_indices: Start index in node_li for each request
         req_prefix_start_indices: Start position in token pool for each compressed node chain
-        radix_block_size: Size of each original node (stored for token pool update)
-        compressed_size: Size of each compressed node (stored for token pool update)
     """
-    reqs: List["Req"]
-    node_li: List["TreeNode"]
-    original_indices: torch.Tensor
-    compressed_indices: Optional[torch.Tensor] = None
+    reqs: List["Req"] = None
     req_node_counts: List[int] = None
     req_start_indices: List[int] = None
     req_prefix_start_indices: List[int] = None
-    radix_block_size: int = 0
-    compressed_size: int = 0
 
     def __post_init__(self):
         if self.req_node_counts is None:
@@ -60,7 +50,7 @@ class CompressionTask:
             self.req_prefix_start_indices = []
 
 
-class NodeCacheCompressor:
+class NodeCacheCompressor(BaseBatchCompressor):
     """
     Batched node cache compressor for efficient KV cache compression.
 
@@ -85,28 +75,18 @@ class NodeCacheCompressor:
         Initialize the node cache compressor.
 
         Args:
-            tree_cache: The radix cache tree (provides token_to_kv_pool_allocator, device,
-                        page_size, compression_tail_budget, and compressor)
+            tree_cache: The radix cache tree
             q_win_size: Query window size for compression threshold
             model_config: Model configuration (for num_hidden_layers)
             compress_stages: 4-character string controlling compression at different stages
                            [during_prefill, after_prefill, during_decode, after_decode]
         """
-        # Check if compressor is available
-        if not hasattr(tree_cache, 'compressor') or tree_cache.compressor is None:
-            raise ValueError("RadixCache must have a compressor configured")
+        # Initialize base class
+        super().__init__(tree_cache, model_config)
 
-        # Extract all needed attributes from tree_cache
-        self.tree_cache = tree_cache
-        self.token_to_kv_pool_allocator = tree_cache.token_to_kv_pool_allocator
-        self.device = tree_cache.device
-        self.compression_tail_budget = tree_cache.compression_tail_budget
-        self.model_config = model_config
+        # Decode-specific attributes
         self.q_win_size = q_win_size
-        self.radix_block_size = tree_cache.page_size
-
-        self.compressor = tree_cache.compressor
-        self.compressed_size = self.compressor.processed_budget
+        self.compression_tail_budget = tree_cache.compression_tail_budget
         self.compress_stages = compress_stages
 
     def compress_batch_nodes(self, batch: "ScheduleBatch") -> int:
@@ -133,20 +113,20 @@ class NodeCacheCompressor:
 
         logger.debug(f"Collected {len(task.node_li)} compression nodes from {len(task.reqs)} requests")
 
-        # Step 2: Allocate compressed indices for all nodes (continuous tensor)
+        # Step 2: Allocate compressed indices (shared implementation from base class)
         if not self._allocate_compressed_indices(task):
             logger.warning("Failed to allocate compressed indices")
             return 0
 
         logger.debug(f"Successfully allocated continuous indices for {len(task.node_li)} nodes")
 
-        # Step 3: Submit all compression as single batched GPU operation
+        # Step 3: Compress layers (shared implementation from base class)
         self._batch_compress_layers(task)
 
         logger.debug(f"Completed GPU compression for {len(task.node_li)} nodes")
 
-        # Step 4: Update all metadata
-        tokens_saved = self._update_all_metadata(task)
+        # Step 4: Update metadata (decode-specific implementation)
+        tokens_saved = self._update_metadata(task)
 
         # Step 5: Store CompressionTask in batch for token pool update in prepare_for_decode
         batch.compression_task = task
@@ -158,7 +138,7 @@ class NodeCacheCompressor:
 
         return len(task.node_li)
 
-    def _collect_compression_tasks(self, batch: "ScheduleBatch") -> Optional[CompressionTask]:
+    def _collect_compression_tasks(self, batch: "ScheduleBatch") -> Optional[DecodeCompressionTask]:
         """
         Step 1: Collect all compress-ready nodes from batch requests, exploring ancestor chains.
 
@@ -236,15 +216,15 @@ class NodeCacheCompressor:
         # Build single continuous tensor for all original indices
         original_indices = torch.concat(original_indices_list, dim=0).to(self.device)
 
-        task = CompressionTask(
-            reqs=reqs,
+        task = DecodeCompressionTask(
             node_li=node_li,
             original_indices=original_indices,
+            radix_block_size=self.radix_block_size,
+            compressed_size=self.compressed_size,
+            reqs=reqs,
             req_node_counts=req_node_counts,
             req_start_indices=req_start_indices,
             req_prefix_start_indices=req_prefix_start_indices,
-            radix_block_size=self.radix_block_size,
-            compressed_size=self.compressed_size,
         )
         return task
 
@@ -333,72 +313,7 @@ class NodeCacheCompressor:
         # return node_start_idx
         return node.idx_len - node.value.size(0)
 
-    def _allocate_compressed_indices(self, task: CompressionTask) -> bool:
-        """
-        Step 2: Allocate compressed KV cache indices for all nodes as a continuous tensor.
-
-        Allocates compressed_size slots for each node in the batch.
-        All allocations are concatenated into a single continuous tensor.
-
-        Args:
-            task: The batch compression task
-
-        Returns:
-            True if allocation succeeds, False otherwise
-        """
-        compressed_indices_list = []
-
-        try:
-            # Allocate for each node
-            required_ind_num = self.compressed_size * len(task.node_li)
-            compressed_indices = self.token_to_kv_pool_allocator.alloc(required_ind_num)
-            if compressed_indices is None:
-                raise ValueError(f"no enough free indices!")
-            # Build single continuous tensor by concatenating all allocated tensors
-            task.compressed_indices = compressed_indices
-
-            return True
-
-        except Exception as e:
-            logger.warning(f"Failed to allocate compressed indices: {e}")
-            # Free any partial allocations if needed
-            # Note: This is simplified; in production, you'd need to track and free partial allocations
-            return False
-
-    def _batch_compress_layers(self, task: CompressionTask):
-        """
-        Step 3: Submit all compression tasks to GPU at once using continuous tensors.
-
-        Compresses all nodes for each layer by passing the entire continuous tensors.
-        This is maximally efficient, requiring only num_layers GPU calls total.
-
-        Args:
-            task: The batch compression task with continuous tensors
-        """
-        num_layers = self.model_config.num_hidden_layers
-
-        # Get KV pool for compression
-        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
-
-        try:
-            # Compress all nodes for each layer in a single call
-            for layer_idx in range(num_layers):
-                self.compressor.compress_layer(
-                    layer_idx=layer_idx,
-                    kv_pool=kv_pool,
-                    value=task.original_indices,          # Entire continuous tensor
-                    out_cache_loc=task.compressed_indices, # Entire continuous tensor
-                    top_budget=self.compressor.top_budget,
-                    residual_budget=self.compressor.processed_residual_budget,
-                    residual_heap_size=self.compressor.residual_heap_size,
-                )
-        except Exception as e:
-            logger.error(f"Compression failed for layer {layer_idx}: {e}")
-            # Mark the entire task as failed
-            task.compressed_indices = None
-            return
-
-    def _update_all_metadata(self, task: CompressionTask) -> int:
+    def _update_metadata(self, task: DecodeCompressionTask) -> int:
         """
         Step 4: Update all metadata after compression using batch tensor operations.
 

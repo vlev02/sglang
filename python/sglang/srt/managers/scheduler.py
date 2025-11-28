@@ -664,6 +664,10 @@ class Scheduler(
                     compress_stages=server_args.compress_stages,
                 )
 
+                # Set model config for insertion compressor if compression is enabled
+                if hasattr(self.tree_cache, 'set_model_config'):
+                    self.tree_cache.set_model_config(self.model_config)
+
         self.decode_mem_cache_buf_multiplier = (
             1
             if self.spec_algorithm.is_none()
