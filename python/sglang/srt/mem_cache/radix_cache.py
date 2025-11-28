@@ -36,7 +36,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.mem_cache.node_compression import NodeCompressor
+from sglang.srt.mem_cache.compression import NodeCompressor
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -197,7 +197,7 @@ class RadixCache(BasePrefixCache):
 
             # Create insertion compressor for batched compression during insertion
             # Note: model_config will be set later via set_model_config()
-            from sglang.srt.mem_cache.insertion_compressor import InsertionCacheCompressor
+            from sglang.srt.mem_cache.compression import InsertionCacheCompressor
             self.insertion_compressor = InsertionCacheCompressor(self, None)
         else:
             self.compressor = None

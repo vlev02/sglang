@@ -122,7 +122,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
-from sglang.srt.managers.node_cache_compressor import NodeCacheCompressor
+from sglang.srt.mem_cache.compression import NodeCacheCompressor
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )

@@ -13,7 +13,7 @@ All implementations inherit from BaseNodeCompressor and maintain the same interf
 
 import torch
 from typing import Tuple, TYPE_CHECKING
-from sglang.srt.mem_cache.base_compressor import OptimizedNodeCompressor
+from sglang.srt.mem_cache.compression.base_compressor import OptimizedNodeCompressor
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
