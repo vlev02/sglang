@@ -607,7 +607,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # OPTIMIZATION: Conditional contiguous for cache_loc
             cache_loc_arg = cache_loc if cache_loc.is_contiguous() else cache_loc.contiguous()
             q_win_size = self.q_win_size if '1' in self.compress_stages[1:] else 0
-            comp_args += [cache_loc_arg, forward_batch.prefix_cache_lens, self.ext_cache_dim, self.q_win_size, self.update_rate]
+            comp_args += [cache_loc_arg, forward_batch.prefix_cache_lens, self.ext_cache_dim, q_win_size, self.update_rate]
 
         # OPTIMIZATION: Conditional contiguous for q
         q_contig = q if q.is_contiguous() else q.contiguous()
