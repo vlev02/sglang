@@ -310,12 +310,22 @@ async def get_server_args():
 
 @app.get("/get_server_info")
 async def get_server_info():
-    # Returns interna states per DP.
+    # Returns internal states per DP.
     internal_states: List[Dict[Any, Any]] = (
         await _global_state.tokenizer_manager.get_internal_state()
     )
+    # Convert ServerArgs to dict, handling non-serializable types like torch.dtype
+    server_args_dict = {}
+    for field in dataclasses.fields(_global_state.tokenizer_manager.server_args):
+        value = getattr(_global_state.tokenizer_manager.server_args, field.name)
+        # Convert torch.dtype to string
+        if isinstance(value, torch.dtype):
+            server_args_dict[field.name] = str(value)
+        else:
+            server_args_dict[field.name] = value
+
     return {
-        **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
+        **server_args_dict,
         **_global_state.scheduler_info,
         "internal_states": internal_states,
         "version": __version__,

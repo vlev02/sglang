@@ -36,7 +36,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.mem_cache.node_compression import NodeCompressor
+from sglang.srt.mem_cache.compression import NodeCompressor
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -194,8 +194,26 @@ class RadixCache(BasePrefixCache):
                 })
 
             self.compressor = NodeCompressor(**compressor_kwargs)
+
+            # Create insertion compressor for batched compression during insertion
+            # Note: model_config will be set later via set_model_config()
+            from sglang.srt.mem_cache.compression import InsertionCacheCompressor
+            self.insertion_compressor = InsertionCacheCompressor(self, None)
         else:
             self.compressor = None
+            self.insertion_compressor = None
+
+    def set_model_config(self, model_config):
+        """
+        Set model configuration for insertion compressor.
+
+        This is called after RadixCache initialization when model_config becomes available.
+
+        Args:
+            model_config: Model configuration with num_hidden_layers
+        """
+        if self.insertion_compressor is not None:
+            self.insertion_compressor.model_config = model_config
 
     ##### Public API #####
 
@@ -263,6 +281,10 @@ class RadixCache(BasePrefixCache):
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
+        # Begin batch compression for insertion stage
+        if self.insertion_compressor and self.compress_stages[3] == '1':
+            self.insertion_compressor.begin_batch()
+
         token_ids = (req.origin_input_ids + req.output_ids)[:-1]
         evict_len = req.evict_len
         id_len = len(token_ids)
@@ -282,12 +304,17 @@ class RadixCache(BasePrefixCache):
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
+        # Insert will mark nodes for compression instead of compressing immediately
         new_prefix_len = self.insert( # new_prefix_len: the length of already existed ids in tree
             token_ids[:page_aligned_len], page_aligned_kv_indices, compression=self.compress_stages[3] == '1'
         )
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.tree_idxlen: new_prefix_len - req.evict_len]
         )
+
+        # Compress all marked nodes in batch
+        if self.insertion_compressor and self.compress_stages[3] == '1':
+            self.insertion_compressor.compress_batch()
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
@@ -297,6 +324,10 @@ class RadixCache(BasePrefixCache):
         """Cache request when it is unfinished."""
         if self.disable:
             return
+
+        # Begin batch compression for insertion stage
+        if self.insertion_compressor and self.compress_stages[0] == '1':
+            self.insertion_compressor.begin_batch()
 
         token_ids = req.fill_ids
         evict_len = req.evict_len
@@ -320,10 +351,15 @@ class RadixCache(BasePrefixCache):
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
         # Radix Cache takes one ref in memory pool
+        # Insert will mark nodes for compression instead of compressing immediately
         new_prefix_len = self.insert(page_aligned_token_ids, page_aligned_kv_indices, compression=self.compress_stages[0] == '1')
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.tree_idxlen: new_prefix_len - req.evict_len]
         )
+
+        # Compress all marked nodes in batch
+        if self.insertion_compressor and self.compress_stages[0] == '1':
+            self.insertion_compressor.compress_batch()
 
         # The prefix indices could be updated, reuse it
         new_indices, new_last_node, _, _ = self.match_prefix(page_aligned_token_ids)
@@ -515,7 +551,11 @@ class RadixCache(BasePrefixCache):
             new_node.value = child_value
             node.children[child_key] = new_node
             if compression and len(key) >= self.compression_tail_budget:
-                self._compress_node(new_node)
+                # Use batched compression if available, otherwise fallback to immediate compression
+                if self.insertion_compressor:
+                    self.insertion_compressor.mark_node_for_compression(new_node)
+                else:
+                    self._compress_node(new_node)
             self.evictable_size_ += len(new_node.value)
             self._record_store_event(new_node)
             node = new_node

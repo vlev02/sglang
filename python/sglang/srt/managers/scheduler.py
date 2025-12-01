@@ -122,7 +122,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
-from sglang.srt.managers.node_cache_compressor import NodeCacheCompressor
+from sglang.srt.mem_cache.compression import NodeCacheCompressor
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
@@ -663,6 +663,10 @@ class Scheduler(
                     compression_residual_clip=server_args.compression_residual_clip,
                     compress_stages=server_args.compress_stages,
                 )
+
+                # Set model config for insertion compressor if compression is enabled
+                if hasattr(self.tree_cache, 'set_model_config'):
+                    self.tree_cache.set_model_config(self.model_config)
 
         self.decode_mem_cache_buf_multiplier = (
             1
@@ -2334,6 +2338,36 @@ class Scheduler(
             ret["step_time_dict"] = self.step_time_dict
 
         ret["load"] = self.get_load()
+
+        # Add detailed scheduler memory metrics from check_memory()
+        ret["num_running_reqs"] = len(self.running_batch.reqs)
+        ret["num_queue_reqs"] = len(self.waiting_queue)
+
+        if self.is_hybrid:
+            (
+                full_num_used,
+                swa_num_used,
+                full_token_usage,
+                swa_token_usage,
+                full_available_size,
+                full_evictable_size,
+                swa_available_size,
+                swa_evictable_size,
+            ) = self._get_swa_token_info()
+            ret["full_num_used"] = full_num_used
+            ret["full_token_usage"] = round(full_token_usage, 4)
+            ret["full_available_size"] = full_available_size
+            ret["full_evictable_size"] = full_evictable_size
+            ret["swa_num_used"] = swa_num_used
+            ret["swa_token_usage"] = round(swa_token_usage, 4)
+            ret["swa_available_size"] = swa_available_size
+            ret["swa_evictable_size"] = swa_evictable_size
+        else:
+            num_used, token_usage, available_size, evictable_size = self._get_token_info()
+            ret["num_used"] = num_used
+            ret["token_usage"] = round(token_usage, 4)
+            ret["available_size"] = available_size
+            ret["evictable_size"] = evictable_size
 
         return GetInternalStateReqOutput(internal_state=ret)
 

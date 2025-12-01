@@ -81,6 +81,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.KV_compression = model_runner.server_args.kv_cache_compression
         self.ext_cache_dim = model_runner.server_args.ext_cache_dim
         self.q_win_size = model_runner.server_args.q_win_size
+        self.compress_stages = model_runner.server_args.compress_stages
         self.update_rate = model_runner.server_args.update_rate
         self.ext_cache_dtype = model_runner.server_args.ext_cache_dtype
         # Parse constants
@@ -507,7 +508,8 @@ class FlashInferAttnBackend(AttentionBackend):
             # Use prefix_cache_lens which already contains tree_idlen - evict_len
             # OPTIMIZATION: Conditional contiguous for cache_loc
             cache_loc_arg = cache_loc if cache_loc.is_contiguous() else cache_loc.contiguous()
-            comp_args += [cache_loc_arg, forward_batch.prefix_cache_lens, self.ext_cache_dim, self.q_win_size, self.update_rate]
+            q_win_size = self.q_win_size if self.compress_stages[0] == '1' else 0
+            comp_args += [cache_loc_arg, forward_batch.prefix_cache_lens, self.ext_cache_dim, q_win_size, self.update_rate]
         if not self.forward_metadata.use_ragged:
             raise NotImplementedError() # add by sean
             if k is not None:
@@ -604,6 +606,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # Use prefix_cache_lens which already contains tree_idlen - evict_len
             # OPTIMIZATION: Conditional contiguous for cache_loc
             cache_loc_arg = cache_loc if cache_loc.is_contiguous() else cache_loc.contiguous()
+            q_win_size = self.q_win_size if '1' in self.compress_stages[1:] else 0
             comp_args += [cache_loc_arg, forward_batch.prefix_cache_lens, self.ext_cache_dim, self.q_win_size, self.update_rate]
 
         # OPTIMIZATION: Conditional contiguous for q

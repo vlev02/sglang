@@ -1663,7 +1663,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return
 
         task = self.compression_task
-        bs = len(task.reqs)
+        bs = len(task.req_list)
 
         if bs == 0:
             return
@@ -1672,12 +1672,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         compressed_metadata = []  # [req_pool_idx, prefix_start, compressed_size, offset_in_task]
         tail_metadata = []        # [req_pool_idx, tail_start, tail_size, original_tail_start]
 
-        for req_idx, req in enumerate(task.reqs):
+        for req_idx, req in enumerate(task.req_list):
             start_node_idx = task.req_start_indices[req_idx]
             node_count = task.req_node_counts[req_idx]
             prefix_start = task.req_prefix_start_indices[req_idx]
 
-            original_total_size = node_count * task.radix_block_size
+            original_total_size = node_count * task.page_size
             compressed_total_size = node_count * task.compressed_size
 
             # Compressed part metadata
