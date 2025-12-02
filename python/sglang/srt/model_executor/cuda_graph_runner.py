@@ -705,7 +705,7 @@ class CudaGraphRunner:
             self.capture_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=self.seq_lens_cpu[:bs],
-            # evict_lens=self.evict_lens[:bs] if forward_batch.evict_lens is not None else None,
+            evict_lens=self.evict_lens[:bs] if forward_batch.evict_lens is not None else None,
             # prefix_cache_lens=self.prefix_cache_lens[:bs] if forward_batch.prefix_cache_lens is not None else None,
         )
 
