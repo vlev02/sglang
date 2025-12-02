@@ -44,6 +44,8 @@ import torch
 import triton
 import triton.language as tl
 
+logger = logging.getLogger(__name__)
+
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
@@ -972,7 +974,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
     @property
     def evict_lens(self,):
-        return [r.evict_len for r in self.reqs]
+        evict_lens = [r.evict_len for r in self.reqs]
+        # Log evict_lens values when non-zero (debug only)
+        if logger.isEnabledFor(logging.DEBUG) and len(self.reqs) <= 5 and any(evict_lens):
+            logger.debug(f"[EVICT_LENS_PROPERTY] bs:{len(self.reqs)} evict_lens:{evict_lens} req_evict_lens:[{', '.join(f'req{i}:{r.evict_len}' for i,r in enumerate(self.reqs))}]")
+        return evict_lens
 
     @property
     def prefix_cache_lens(self,):
@@ -1660,13 +1666,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         No concatenation needed - uses task.compressed_indices and req_to_token_pool directly.
         """
         if not hasattr(self, 'compression_task') or self.compression_task is None:
+            logger.debug("[APPLY_COMPRESSION] No compression_task to apply")
             return
 
         task = self.compression_task
         bs = len(task.req_list)
 
         if bs == 0:
+            logger.debug("[APPLY_COMPRESSION] compression_task has no requests")
             return
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"[APPLY_COMPRESSION_START] bs:{bs} nodes:{len(task.node_list)} compressed_indices_len:{len(task.compressed_indices) if task.compressed_indices is not None else 0}")
 
         # Collect metadata for compressed and tail parts separately
         compressed_metadata = []  # [req_pool_idx, prefix_start, compressed_size, offset_in_task]
@@ -1802,6 +1813,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 f"Applied compression (sequential) for {bs} requests: "
                 f"wrote {sum(m[2] for m in compressed_metadata)} compressed + {sum(m[2] for m in tail_metadata)} tail indices"
             )
+
+        # Log completion summary (debug only)
+        if logger.isEnabledFor(logging.DEBUG):
+            total_compressed = sum(m[2] for m in compressed_metadata) if compressed_metadata else 0
+            total_tail = sum(m[2] for m in tail_metadata) if tail_metadata else 0
+            logger.debug(f"[APPLY_COMPRESSION_END] bs:{bs} compressed_tokens:{total_compressed} tail_tokens:{total_tail}")
 
         # Clear task after processing
         self.compression_task = None
@@ -1993,6 +2010,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_logprob_start_lens = self.extend_logprob_start_lens
         evict_lens = self.evict_lens
         prefix_cache_lens = self.prefix_cache_lens
+
+        # Log evict_lens being passed to ModelWorkerBatch (debug only)
+        if logger.isEnabledFor(logging.DEBUG) and len(self.reqs) <= 5 and any(evict_lens):
+            logger.debug(f"[PREPARE_DECODE_EVICT] bs:{len(self.reqs)} evict_lens:{evict_lens} seq_lens:{self.seq_lens.cpu().tolist()}")
 
         # Create seq_lens_cpu when needed
         if (

@@ -20,12 +20,15 @@ The radix tree data structure for managing the KV cache.
 """
 
 import heapq
+import logging
 import time
 from collections import defaultdict
 from functools import partial
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
@@ -359,10 +362,21 @@ class RadixCache(BasePrefixCache):
 
         # Compress all marked nodes in batch
         if self.insertion_compressor and self.compress_stages[0] == '1':
-            self.insertion_compressor.compress_batch()
+            if logger.isEnabledFor(logging.DEBUG):
+                t_start = time.time()
+                num_compressed = self.insertion_compressor.compress_batch()
+                t_end = time.time()
+                logger.debug(f"[INSERTION_COMPRESS] time:{(t_end-t_start)*1000:.2f}ms nodes:{num_compressed}")
+            else:
+                num_compressed = self.insertion_compressor.compress_batch()
 
         # The prefix indices could be updated, reuse it
         new_indices, new_last_node, _, _ = self.match_prefix(page_aligned_token_ids)
+
+        # Log evict_len after compression
+        if self.insertion_compressor and self.compress_stages[0] == '1':
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[INSERTION_COMPRESS_EVICT] new_last_node.id_len:{new_last_node.id_len} idx_len:{new_last_node.idx_len} evict_len:{new_last_node.evict_len}")
         assert len(req.prefix_indices) == req.tree_idxlen # assert by Sean
         assert page_aligned_len == new_last_node.id_len, f"{page_aligned_len=}, {new_last_node.id_len=}"
         self.req_to_token_pool.write(
