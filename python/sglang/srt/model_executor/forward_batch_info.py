@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -37,6 +38,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import (
@@ -377,6 +380,9 @@ class ForwardBatch:
 
         # Init position information
         if ret.forward_mode.is_decode():
+            # Log evict_lens before creating tensor (debug only)
+            if logger.isEnabledFor(logging.DEBUG) and len(batch.evict_lens) <= 5 and any(batch.evict_lens):
+                logger.debug(f"[FORWARDBATCH_DECODE_EVICT] bs:{len(batch.evict_lens)} evict_lens:{batch.evict_lens} seq_lens:{batch.seq_lens.cpu().tolist()}")
             ret.evict_lens = torch.tensor(
                 batch.evict_lens, dtype=torch.int32 # TODO: need check
             ).to(device, non_blocking=True)
