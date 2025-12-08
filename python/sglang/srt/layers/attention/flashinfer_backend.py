@@ -607,7 +607,10 @@ class FlashInferAttnBackend(AttentionBackend):
             # Use prefix_cache_lens which already contains tree_idlen - evict_len
             # OPTIMIZATION: Conditional contiguous for cache_loc
             cache_loc_arg = cache_loc if cache_loc.is_contiguous() else cache_loc.contiguous()
-            q_win_size = self.q_win_size if '1' in self.compress_stages[1:] else 0
+            # Determine q_win_size based on compression stages and early decode status
+            q_win_size = self.q_win_size if '1' in self.compress_stages[2:] else 0
+            if self.compress_stages[1] == '1' and forward_batch.has_early_stage_decode_reqs:
+                q_win_size = self.q_win_size
             comp_args += [cache_loc_arg, forward_batch.prefix_cache_lens, self.ext_cache_dim, q_win_size, self.update_rate]
 
         # OPTIMIZATION: Conditional contiguous for q
@@ -793,41 +796,10 @@ class FlashInferIndicesUpdaterDecode:
         use_sliding_window_kv_pool: bool = False,
         evict_lens: Optional[torch.Tensor] = None,
     ):
-        # [PERF_LOG] Log detailed KV cache lengths per request
-        bs = len(req_pool_indices)
-
-        # Log before eviction (debug only) - only compute if needed
-        if logger.isEnabledFor(logging.DEBUG) and bs <= 10:
-            orig_lens_list = paged_kernel_lens.cpu().tolist()
-            logger.debug(f"[KV_CACHE_DETAIL] batch_size:{bs} original_lengths:{orig_lens_list}")
-
-        # [PERF_LOG] Log KV cache lengths before and after eviction (DEBUG only)
+        # evict calibration
         if evict_lens is not None:
-            # evict calibration (must always execute for correctness)
-            evict_sum = evict_lens.sum().item()  # Need this for calibration
             paged_kernel_lens = paged_kernel_lens.detach().clone() - evict_lens
-            paged_kernel_lens_sum -= evict_sum
-
-            # All logging and statistics computation only at DEBUG level
-            if logger.isEnabledFor(logging.DEBUG):
-                orig_lens_sum = paged_kernel_lens_sum + evict_sum  # Reconstruct original sum
-                orig_lens_mean = (paged_kernel_lens + evict_lens).float().mean().item()
-                evict_mean = evict_lens.float().mean().item()
-                new_lens_mean = paged_kernel_lens.float().mean().item()
-
-                # Performance summary
-                logger.debug(f"[PERF_KV_EVICT] orig_sum:{orig_lens_sum} evict_sum:{int(evict_sum)} new_sum:{paged_kernel_lens_sum} orig_mean:{orig_lens_mean:.1f} evict_mean:{evict_mean:.1f} new_mean:{new_lens_mean:.1f} reduction:{(evict_sum/orig_lens_sum*100):.1f}%")
-
-                # Detailed per-request logging (only for small batches)
-                if bs <= 10:
-                    evict_list = evict_lens.cpu().tolist()
-                    new_lens_list = paged_kernel_lens.cpu().tolist()
-                    logger.debug(f"[KV_CACHE_EVICT_DETAIL] evict_lengths:{evict_list} final_lengths:{new_lens_list}")
-        else:
-            # No eviction - log current lengths (debug only) - only compute if needed
-            if logger.isEnabledFor(logging.DEBUG) and bs <= 10:
-                orig_lens_list = paged_kernel_lens.cpu().tolist()
-                logger.debug(f"[KV_CACHE_NO_EVICT] final_lengths:{orig_lens_list}")
+            paged_kernel_lens_sum -= evict_lens.sum().item()
         if spec_info is None:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -850,10 +822,6 @@ class FlashInferIndicesUpdaterDecode:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
-
-            # Log actual KV indices created (debug only)
-            if logger.isEnabledFor(logging.DEBUG) and bs <= 10:
-                logger.debug(f"[FLASHINFER_KV_INDICES] bs:{bs} total_indices:{paged_kernel_lens_sum} indptr:{kv_indptr.cpu().tolist()}")
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
@@ -1066,11 +1034,6 @@ class FlashInferIndicesUpdaterPrefill:
         if evict_lens is not None:
             paged_kernel_lens = paged_kernel_lens.detach().clone() - evict_lens
             paged_kernel_lens_sum -= evict_lens.sum().item()
-
-            # Log eviction effect in prefill (debug only)
-            if logger.isEnabledFor(logging.DEBUG) and bs <= 10:
-                logger.debug(f"[PREFILL_EVICT] evict_lens:{evict_lens.cpu().tolist()} new_paged_kernel_lens:{paged_kernel_lens.cpu().tolist()}")
-
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices) # == bs
             # Normal extend
@@ -1093,10 +1056,6 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
-
-            # Log actual KV indices created for prefill (debug only)
-            if logger.isEnabledFor(logging.DEBUG) and bs <= 10:
-                logger.debug(f"[PREFILL_KV_INDICES] bs:{bs} total_indices:{paged_kernel_lens_sum} kv_indptr:{kv_indptr.cpu().tolist()} qo_indptr:{qo_indptr.cpu().tolist()}")
         else:
             assert isinstance(spec_info, EagleDraftInput) or isinstance(
                 spec_info, EagleVerifyInput
