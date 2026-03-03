@@ -653,15 +653,15 @@ class Req:
     
     @property
     def tree_idlen(self):
-        return self.last_node.id_len#  if self.last_node is not None else 0
-    
+        return self.last_node.id_len if self.last_node is not None else 0
+
     @property
     def tree_idxlen(self):
-        return self.last_node.idx_len#  if self.last_node is not None else 0
-    
+        return self.last_node.idx_len if self.last_node is not None else 0
+
     @property
     def evict_len(self):
-        return self.last_node.evict_len#  if self.last_node is not None else 0
+        return self.last_node.evict_len if self.last_node is not None else 0
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
