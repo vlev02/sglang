@@ -1635,6 +1635,17 @@ class Scheduler(
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
             self.tree_cache.cache_unfinished_req(self.chunked_req)
+            # When page_size > 1, cache_unfinished_req appends non-page-aligned
+            # tail KV indices to prefix_indices.  Since we free the req pool slot
+            # below, those tail KV slots would be orphaned.  Fix:
+            #   1. Trim prefix_indices back to tree-only indices
+            #   2. Free the tail KV slots from the KV pool
+            req = self.chunked_req
+            tree_idxlen = req.tree_idxlen
+            if len(req.prefix_indices) > tree_idxlen:
+                tail_kv_indices = req.prefix_indices[tree_idxlen:]
+                req.prefix_indices = req.prefix_indices[:tree_idxlen]
+                self.token_to_kv_pool_allocator.free(tail_kv_indices)
             # chunked request keeps its rid but will get a new req_pool_idx
             self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
         if self.last_batch and self.last_batch.forward_mode.is_extend():
