@@ -108,6 +108,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "num_reserved_decode_tokens",
     "weight_loader_disable_mmap",
     "enable_triton_kernel_moe",
+    "q_win_size",
+    "compress_stages",
 ]
 
 # Put some global args for easy access
@@ -651,15 +653,15 @@ class Req:
     
     @property
     def tree_idlen(self):
-        return self.last_node.id_len#  if self.last_node is not None else 0
-    
+        return self.last_node.id_len if self.last_node is not None else 0
+
     @property
     def tree_idxlen(self):
-        return self.last_node.idx_len#  if self.last_node is not None else 0
-    
+        return self.last_node.idx_len if self.last_node is not None else 0
+
     @property
     def evict_len(self):
-        return self.last_node.evict_len#  if self.last_node is not None else 0
+        return self.last_node.evict_len if self.last_node is not None else 0
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
@@ -974,11 +976,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
     @property
     def evict_lens(self,):
-        evict_lens = [r.evict_len for r in self.reqs]
-        # Log evict_lens values when non-zero (debug only)
-        if logger.isEnabledFor(logging.DEBUG) and len(self.reqs) <= 5 and any(evict_lens):
-            logger.debug(f"[EVICT_LENS_PROPERTY] bs:{len(self.reqs)} evict_lens:{evict_lens} req_evict_lens:[{', '.join(f'req{i}:{r.evict_len}' for i,r in enumerate(self.reqs))}]")
-        return evict_lens
+        return [r.evict_len for r in self.reqs]
 
     @property
     def prefix_cache_lens(self,):
@@ -1666,18 +1664,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         No concatenation needed - uses task.compressed_indices and req_to_token_pool directly.
         """
         if not hasattr(self, 'compression_task') or self.compression_task is None:
-            logger.debug("[APPLY_COMPRESSION] No compression_task to apply")
             return
 
         task = self.compression_task
         bs = len(task.req_list)
 
         if bs == 0:
-            logger.debug("[APPLY_COMPRESSION] compression_task has no requests")
             return
-
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"[APPLY_COMPRESSION_START] bs:{bs} nodes:{len(task.node_list)} compressed_indices_len:{len(task.compressed_indices) if task.compressed_indices is not None else 0}")
 
         # Collect metadata for compressed and tail parts separately
         compressed_metadata = []  # [req_pool_idx, prefix_start, compressed_size, offset_in_task]
@@ -1813,12 +1806,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 f"Applied compression (sequential) for {bs} requests: "
                 f"wrote {sum(m[2] for m in compressed_metadata)} compressed + {sum(m[2] for m in tail_metadata)} tail indices"
             )
-
-        # Log completion summary (debug only)
-        if logger.isEnabledFor(logging.DEBUG):
-            total_compressed = sum(m[2] for m in compressed_metadata) if compressed_metadata else 0
-            total_tail = sum(m[2] for m in tail_metadata) if tail_metadata else 0
-            logger.debug(f"[APPLY_COMPRESSION_END] bs:{bs} compressed_tokens:{total_compressed} tail_tokens:{total_tail}")
 
         # Clear task after processing
         self.compression_task = None
@@ -2011,10 +1998,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_lens = self.evict_lens
         prefix_cache_lens = self.prefix_cache_lens
 
-        # Log evict_lens being passed to ModelWorkerBatch (debug only)
-        if logger.isEnabledFor(logging.DEBUG) and len(self.reqs) <= 5 and any(evict_lens):
-            logger.debug(f"[PREPARE_DECODE_EVICT] bs:{len(self.reqs)} evict_lens:{evict_lens} seq_lens:{self.seq_lens.cpu().tolist()}")
-
         # Create seq_lens_cpu when needed
         if (
             global_server_args_dict["attention_backend"] == "fa3"
@@ -2040,6 +2023,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.sampling_info.grammars = [req.grammar for req in self.reqs]
             else:
                 self.sampling_info.grammars = None
+
+        # Compute KV compression flag: check if any request is in early decode stage
+        # This is used for conditional q_win_size logic in forward_decode
+        has_early_stage_decode_reqs = False
+        q_win_size = global_server_args_dict.get("q_win_size", 0)
+        compress_stages = global_server_args_dict.get("compress_stages", "0000")
+        if q_win_size and compress_stages and compress_stages[1] == '1' and self.forward_mode.is_decode():
+            has_early_stage_decode_reqs = any(
+                len(req.output_ids) - 1 <= q_win_size for req in self.reqs
+            )
 
         global bid
         bid += 1
@@ -2092,6 +2085,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             launch_done=self.launch_done,
+            has_early_stage_decode_reqs=has_early_stage_decode_reqs,
         )
 
     def copy(self):
@@ -2233,6 +2227,9 @@ class ModelWorkerBatch:
     capture_hidden_mode: CaptureHiddenMode = None
     spec_num_draft_tokens: Optional[int] = None
     hicache_consumer_index: int = 0
+
+    # KV compression flag
+    has_early_stage_decode_reqs: bool = False  # True if any request has len(output_ids) - 1 <= q_win_size
 
     # Overlap event
     launch_done: Optional[threading.Event] = None

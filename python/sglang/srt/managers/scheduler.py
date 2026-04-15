@@ -816,6 +816,7 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        last_batch = 0
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -826,17 +827,19 @@ class Scheduler(
             self.cur_batch = batch
 
             if batch:
+                last_batch = 1
+                logger.debug(f"info_time -> {t_batch_start = }")
                 t_forward_start = time.time()
+                logger.debug(f"info_time -> {t_forward_start = }")
                 result = self.run_batch(batch)
-                t_forward_end = time.time()
 
                 t_process_start = time.time()
+                logger.debug(f"info_time -> {t_process_start = }")
                 self.process_batch_result(batch, result)
-                t_process_end = time.time()
-
-                # [PERF_LOG] Log timing breakdown
-                logger.debug(f"[PERF] get_batch:{(t_batch_end-t_batch_start)*1000:.2f}ms forward:{(t_forward_end-t_forward_start)*1000:.2f}ms process:{(t_process_end-t_process_start)*1000:.2f}ms total:{(t_process_end-t_batch_start)*1000:.2f}ms mode:{batch.forward_mode}")
             else:
+                if last_batch:
+                    logger.debug(f"info_time -> {t_batch_end = }")
+                    last_batch = 0
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
                 self.check_tree_cache()
@@ -1632,6 +1635,17 @@ class Scheduler(
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
             self.tree_cache.cache_unfinished_req(self.chunked_req)
+            # When page_size > 1, cache_unfinished_req appends non-page-aligned
+            # tail KV indices to prefix_indices.  Since we free the req pool slot
+            # below, those tail KV slots would be orphaned.  Fix:
+            #   1. Trim prefix_indices back to tree-only indices
+            #   2. Free the tail KV slots from the KV pool
+            req = self.chunked_req
+            tree_idxlen = req.tree_idxlen
+            if len(req.prefix_indices) > tree_idxlen:
+                tail_kv_indices = req.prefix_indices[tree_idxlen:]
+                req.prefix_indices = req.prefix_indices[:tree_idxlen]
+                self.token_to_kv_pool_allocator.free(tail_kv_indices)
             # chunked request keeps its rid but will get a new req_pool_idx
             self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
         if self.last_batch and self.last_batch.forward_mode.is_extend():
@@ -1964,15 +1978,6 @@ class Scheduler(
         launch_done: Optional[threading.Event] = None,
     ):
         if batch.forward_mode.is_decode():
-            # Log decode step information for KV cache monitoring
-            # Log decode steps at DEBUG level to reduce verbosity
-            if logger.isEnabledFor(logging.DEBUG) and len(batch.reqs) <= 5:
-                for i, req in enumerate(batch.reqs):
-                    decode_step = len(req.output_ids)
-                    input_len = len(req.origin_input_ids)
-                    total_len = input_len + decode_step
-                    logger.debug(f"[DECODE_STEP] req_idx:{i} decode_step:{decode_step} input_len:{input_len} total_len:{total_len}")
-
             self.process_batch_result_decode(batch, result, launch_done)
 
             # Compress eligible nodes after decode completes
@@ -1981,15 +1986,7 @@ class Scheduler(
             # 2. All set_kv_buffer() calls have finished
             # 3. We're in disable_overlap mode (single-threaded)
             if self.node_cache_compressor is not None:
-                t_compress_start = time.time()
-                num_compressed = self.node_cache_compressor.compress_batch_nodes(batch)
-                t_compress_end = time.time()
-                logger.debug(f"[PERF_COMPRESS] compression_time:{(t_compress_end-t_compress_start)*1000:.2f}ms nodes_compressed:{num_compressed}")
-
-                # Log evict_len after decode compression (debug only)
-                if logger.isEnabledFor(logging.DEBUG) and num_compressed > 0 and len(batch.reqs) <= 5:
-                    for i, req in enumerate(batch.reqs):
-                        logger.debug(f"[NODE_COMPRESS_EVICT] req_idx:{i} last_node.id_len:{req.last_node.id_len} idx_len:{req.last_node.idx_len} evict_len:{req.evict_len}")
+                self.node_cache_compressor.compress_batch_nodes(batch)
 
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result, launch_done)

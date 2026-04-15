@@ -372,42 +372,28 @@ class DecodeBatchProcessor(BaseBatchProcessor):
         Returns:
             Number of nodes successfully compressed
         """
-        import time
-
         # Step 1: Collect nodes
-        t_collect_start = time.time()
         task = self._collect_tasks(batch)
-        t_collect_end = time.time()
 
         if task is None or len(task.node_list) == 0:
-            logger.debug(f"[PERF_COMPRESS_DETAIL] collect:{(t_collect_end-t_collect_start)*1000:.2f}ms nodes:0 allocate:0ms compress:0ms update:0ms")
             return 0
 
         logger.debug(f"Collected {len(task.node_list)} nodes from {len(task.req_list)} requests")
 
         # Step 2: Allocate indices
-        t_allocate_start = time.time()
-        alloc_success = self._allocate_indices(task)
-        t_allocate_end = time.time()
-
-        if not alloc_success:
+        if not self._allocate_indices(task):
             logger.warning("Failed to allocate compressed indices")
-            logger.debug(f"[PERF_COMPRESS_DETAIL] collect:{(t_collect_end-t_collect_start)*1000:.2f}ms nodes:{len(task.node_list)} allocate:{(t_allocate_end-t_allocate_start)*1000:.2f}ms(FAILED) compress:0ms update:0ms")
             return 0
 
         logger.debug(f"Allocated indices for {len(task.node_list)} nodes")
 
         # Step 3: Compress layers
-        t_compress_start = time.time()
         self._compress_layers(task)
-        t_compress_end = time.time()
 
         logger.debug(f"Completed GPU compression for {len(task.node_list)} nodes")
 
         # Step 4: Update metadata
-        t_update_start = time.time()
         tokens_saved = self._update_metadata(task)
-        t_update_end = time.time()
 
         # Step 5: Store task in batch for token pool update
         batch.compression_task = task
@@ -416,7 +402,6 @@ class DecodeBatchProcessor(BaseBatchProcessor):
             f"Batch compression complete: {len(task.node_list)} nodes compressed "
             f"across {len(task.req_list)} requests, saved ~{tokens_saved} tokens"
         )
-        logger.debug(f"[PERF_COMPRESS_DETAIL] collect:{(t_collect_end-t_collect_start)*1000:.2f}ms nodes:{len(task.node_list)} allocate:{(t_allocate_end-t_allocate_start)*1000:.2f}ms compress:{(t_compress_end-t_compress_start)*1000:.2f}ms update:{(t_update_end-t_update_start)*1000:.2f}ms")
 
         return len(task.node_list)
 

@@ -268,6 +268,9 @@ class ForwardBatch:
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
 
+    # KV compression flag
+    has_early_stage_decode_reqs: bool = False  # True if any request has len(output_ids) - 1 <= q_win_size
+
     # For padding
     padded_static_len: int = -1  # -1 if not padded
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
@@ -316,6 +319,7 @@ class ForwardBatch:
             spec_algorithm=batch.spec_algorithm,
             spec_info=batch.spec_info,
             capture_hidden_mode=batch.capture_hidden_mode,
+            has_early_stage_decode_reqs=batch.has_early_stage_decode_reqs,
             input_embeds=batch.input_embeds,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
@@ -380,9 +384,6 @@ class ForwardBatch:
 
         # Init position information
         if ret.forward_mode.is_decode():
-            # Log evict_lens before creating tensor (debug only)
-            if logger.isEnabledFor(logging.DEBUG) and len(batch.evict_lens) <= 5 and any(batch.evict_lens):
-                logger.debug(f"[FORWARDBATCH_DECODE_EVICT] bs:{len(batch.evict_lens)} evict_lens:{batch.evict_lens} seq_lens:{batch.seq_lens.cpu().tolist()}")
             ret.evict_lens = torch.tensor(
                 batch.evict_lens, dtype=torch.int32 # TODO: need check
             ).to(device, non_blocking=True)
